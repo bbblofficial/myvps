@@ -6,12 +6,12 @@ on:
       tunnel_provider:
         description: 'Choose Tunnel Provider'
         required: true
-        default: 'playit'
+        default: 'cloudflare'
         type: choice
         options:
-          - 'playit'
-          - 'pinggy'
           - 'cloudflare'
+          - 'pinggy'
+          - 'playit'
 
 jobs:
   build:
@@ -20,7 +20,7 @@ jobs:
 
     steps:
       # ----------------------------------------------------------------------
-      # 1. Setup RDP and User
+      # ۱. راه‌اندازی RDP و ایجاد کاربر با بررسی باز بودن پورت ۳۳۸۹
       # ----------------------------------------------------------------------
       - name: 1. Setup RDP and User
         shell: powershell
@@ -37,76 +37,93 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
 
-      # ----------------------------------------------------------------------
-      # Option 1: Playit.gg  (FIXED: no "run" argument)
-      # ----------------------------------------------------------------------
-      - name: 2. Launch Playit Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'playit' }}
-        shell: powershell
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-windows-x86_64.exe" -OutFile "C:\playit.exe"
-          $playitOut = "C:\playit_out.log"
-          $playitErr = "C:\playit_err.log"
-          if (Test-Path $playitOut) { Remove-Item $playitOut -Force }
-          if (Test-Path $playitErr) { Remove-Item $playitErr -Force }
-
-          # CORRECTED: removed the invalid "run" argument
-          $proc = Start-Process -FilePath "C:\playit.exe" -RedirectStandardOutput $playitOut -RedirectStandardError $playitErr -NoNewWindow -PassThru
-
-          Write-Host "Waiting for Playit setup URL..."
-          $claimUrl = $null
-          $timeout = [DateTime]::Now.AddSeconds(60)
-
-          while ([DateTime]::Now -lt $timeout) {
-              if ($proc.HasExited) {
-                  Write-Host "Playit process exited unexpectedly with code: $($proc.ExitCode)" -ForegroundColor Red
-                  break
-              }
-              $outText = if (Test-Path $playitOut) { Get-Content -Path $playitOut -Raw -ErrorAction SilentlyContinue } else { "" }
-              $errText = if (Test-Path $playitErr) { Get-Content -Path $playitErr -Raw -ErrorAction SilentlyContinue } else { "" }
-              $cleanText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
-
-              if ($cleanText -match "(https://playit\.gg/claim/[a-zA-Z0-9_\-]+)") {
-                  $claimUrl = $matches[1]
+          Write-Host "Waiting for RDP Port 3389 to become responsive..."
+          $portReady =$false
+          for ($i = 0; $i -lt 15; $i++) {$check = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+              if ($check.TcpTestSucceeded) {
+                  $portReady =$true
+                  Write-Host "Port 3389 is OPEN and READY!" -ForegroundColor Green
                   break
               }
               Start-Sleep -Seconds 1
           }
-
-          if ($claimUrl) {
-              Write-Host ""
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ">>> PLAYIT RDP TUNNEL STARTED <<<" -ForegroundColor Cyan
-              Write-Host "Claim Link: $claimUrl" -ForegroundColor Yellow
-              Write-Host "Username  : CynetAdmin" -ForegroundColor Yellow
-              Write-Host "Password  : Cynet@2026" -ForegroundColor Yellow
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host "Open the link and add a TCP tunnel for port 3389." -ForegroundColor White
-          } else {
-              Write-Host "[!] Could not fetch Playit claim URL within timeout." -ForegroundColor Red
-              if (Test-Path $playitOut) { Write-Host "--- STDOUT ---"; Get-Content $playitOut }
-              if (Test-Path $playitErr) { Write-Host "--- STDERR ---"; Get-Content $playitErr }
+          if (-not $portReady) {
+              Write-Host "[!] Port 3389 failed to bind." -ForegroundColor Red
               exit 1
           }
 
       # ----------------------------------------------------------------------
-      # Option 2: Pinggy
+      # گزینه ۱: Cloudflare Tunnel (رفع خطای ۱۰۳۳ با اجبار به پروتکل http2)
       # ----------------------------------------------------------------------
-      - name: 3. Launch Pinggy Tunnel
+      - name: 2. Launch Cloudflare Tunnel
+        if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
+          $logFile = "C:\cloudflared.log"
+          if (Test-Path $logFile) { Remove-Item$logFile -Force }
+
+          # فورس کردن پروتکل http2 مانع از قطعی ناشی از فیلتر شدن UDP/QUIC می‌شود
+          $cfArgs = "tunnel --url tcp://localhost:3389 --protocol http2 --logfile $logFile --no-autoupdate"
+          $proc = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $cfArgs -NoNewWindow -PassThru
+
+          Write-Host "Waiting for TryCloudflare Tunnel URL..."
+          $domain = $null$timeout = [DateTime]::Now.AddSeconds(60)
+
+          while ([DateTime]::Now -lt $timeout) {
+              if ($proc.HasExited) {
+                  Write-Host "Cloudflared process terminated with code: $($proc.ExitCode)" -ForegroundColor Red
+                  break
+              }
+
+              if (Test-Path $logFile) {
+                  $content = Get-Content -Path$logFile -Raw -ErrorAction SilentlyContinue
+                  if ($content -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
+                      $domain =$matches[1]
+                      break
+                  }
+              }
+              Start-Sleep -Seconds 1
+          }
+
+          if ($domain) {
+              Write-Host ""
+              Write-Host "==================================================" -ForegroundColor Green
+              Write-Host ">>> CLOUDFLARE RDP READY <<<" -ForegroundColor Cyan
+              Write-Host "Domain   : $domain" -ForegroundColor Yellow
+              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
+              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
+              Write-Host "==================================================" -ForegroundColor Green
+              Write-Host ""
+              Write-Host "[1] Run this on your local PC in CMD/PowerShell:" -ForegroundColor Magenta
+              Write-Host "cloudflared access rdp --hostname $domain --url rdp://localhost:13389" -ForegroundColor White
+              Write-Host ""
+              Write-Host "[2] Then open Remote Desktop (mstsc) and connect to:" -ForegroundColor Magenta
+              Write-Host "localhost:13389" -ForegroundColor White
+              Write-Host "==================================================" -ForegroundColor Green
+          } else {
+              Write-Host "[!] Failed to get Cloudflare tunnel URL." -ForegroundColor Red
+              if (Test-Path $logFile) { Get-Content$logFile }
+              exit 1
+          }
+
+      # ----------------------------------------------------------------------
+      # گزینه ۲: Pinggy (مستقیم با MSTSC، بدون نیاز به نصب نرم‌افزار روی سیستم)
+      # ----------------------------------------------------------------------
+      - name: 3. Launch Pinggy Tunnel (Direct MSTSC)
         if: ${{ github.event.inputs.tunnel_provider == 'pinggy' }}
         shell: powershell
         run: |
           $logOut = "C:\pinggy_out.log"
           $logErr = "C:\pinggy_err.log"
-          if (Test-Path $logOut) { Remove-Item $logOut -Force }
-          if (Test-Path $logErr) { Remove-Item $logErr -Force }
+          if (Test-Path $logOut) { Remove-Item$logOut -Force }
+          if (Test-Path $logErr) { Remove-Item$logErr -Force }
 
           $sshArgs = "-p 443 -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ServerAliveInterval=30 -L 4300:localhost:4300 -R 0:localhost:3389 b+tcp@a.pinggy.io"
-          $proc = Start-Process -FilePath "ssh" -ArgumentList $sshArgs -RedirectStandardOutput $logOut -RedirectStandardError $logErr -NoNewWindow -PassThru
+          $proc = Start-Process -FilePath "ssh" -ArgumentList $sshArgs -RedirectStandardOutput $logOut -RedirectStandardError$logErr -NoNewWindow -PassThru
 
           Write-Host "Waiting for Pinggy direct TCP address..."
-          $directUrl = $null
-          $timeout = [DateTime]::Now.AddSeconds(60)
+          $directUrl = $null$timeout = [DateTime]::Now.AddSeconds(60)
 
           while ([DateTime]::Now -lt $timeout) {
               if ($proc.HasExited) {
@@ -116,14 +133,14 @@ jobs:
 
               try {
                   $resp = Invoke-RestMethod -Uri "http://localhost:4300/urls" -TimeoutSec 1 -ErrorAction SilentlyContinue
-                  if ($resp -and $resp.tcp) {
-                      $directUrl = $resp.tcp -replace '^tcp://', ''
+                  if ($resp -and$resp.tcp) {
+                      $directUrl =$resp.tcp -replace '^tcp://', ''
                       break
                   }
               } catch {}
 
-              $outText = if (Test-Path $logOut) { Get-Content -Path $logOut -Raw -ErrorAction SilentlyContinue } else { "" }
-              $errText = if (Test-Path $logErr) { Get-Content -Path $logErr -Raw -ErrorAction SilentlyContinue } else { "" }
+              $outText = if (Test-Path $logOut) { Get-Content -Path$logOut -Raw -ErrorAction SilentlyContinue } else { "" }
+              $errText = if (Test-Path $logErr) { Get-Content -Path$logErr -Raw -ErrorAction SilentlyContinue } else { "" }
               $cleanText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
 
               if ($cleanText -match "tcp://([a-zA-Z0-9\.\-]+:\d+)") {
@@ -132,7 +149,11 @@ jobs:
               } elseif ($cleanText -match "([a-zA-Z0-9\.\-]+\.pinggy\.[a-z]+:\d+)") {
                   $directUrl = $matches[1]
                   break
+              } elseif ($cleanText -match "([a-zA-Z0-9\.\-]+\.pinggy\.link:\d+)") {
+                  $directUrl = $matches[1]
+                  break
               }
+
               Start-Sleep -Seconds 1
           }
 
@@ -153,63 +174,60 @@ jobs:
           }
 
       # ----------------------------------------------------------------------
-      # Option 3: Cloudflare Tunnel (CORRECTED)
+      # گزینه ۳: Playit.gg (مستقیم با MSTSC، بدون نیاز به نصب نرم‌افزار روی سیستم)
       # ----------------------------------------------------------------------
-      - name: 4. Launch Cloudflare Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
+      - name: 4. Launch Playit Tunnel (Direct MSTSC)
+        if: ${{ github.event.inputs.tunnel_provider == 'playit' }}
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
-          $cfOut = "C:\cf_out.log"
-          $cfErr = "C:\cf_err.log"
-          if (Test-Path $cfOut) { Remove-Item $cfOut -Force }
-          if (Test-Path $cfErr) { Remove-Item $cfErr -Force }
+          Invoke-WebRequest -Uri "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-windows-x86_64.exe" -OutFile "C:\playit.exe"
+          $playitOut = "C:\playit_out.log"
+          $playitErr = "C:\playit_err.log"
+          if (Test-Path $playitOut) { Remove-Item $playitOut -Force }
+          if (Test-Path $playitErr) { Remove-Item $playitErr -Force }
 
-          # CORRECTED: added --no-autoupdate and --protocol http2
-          $cfArgs = "tunnel --url tcp://localhost:3389 --no-autoupdate --protocol http2"
-          $proc = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $cfArgs -RedirectStandardOutput $cfOut -RedirectStandardError $cfErr -NoNewWindow -PassThru
+          $proc = Start-Process -FilePath "C:\playit.exe" -ArgumentList "run" -RedirectStandardOutput $playitOut -RedirectStandardError $playitErr -NoNewWindow -PassThru
 
-          Write-Host "Waiting for TryCloudflare Tunnel URL..."
-          $domain = $null
+          Write-Host "Waiting for Playit setup URL..."
+          $claimUrl = $null
           $timeout = [DateTime]::Now.AddSeconds(60)
 
           while ([DateTime]::Now -lt $timeout) {
               if ($proc.HasExited) {
-                  Write-Host "Cloudflared process exited with code: $($proc.ExitCode)" -ForegroundColor Red
-                  if (Test-Path $cfErr) { Write-Host "--- STDERR ---"; Get-Content $cfErr }
+                  Write-Host "Playit process exited unexpectedly with code: $($proc.ExitCode)" -ForegroundColor Red
                   break
               }
-              $outText = if (Test-Path $cfOut) { Get-Content -Path $cfOut -Raw -ErrorAction SilentlyContinue } else { "" }
-              $errText = if (Test-Path $cfErr) { Get-Content -Path $cfErr -Raw -ErrorAction SilentlyContinue } else { "" }
-              $combined = "$outText`n$errText"
+              $outText = if (Test-Path $playitOut) { Get-Content -Path $playitOut -Raw -ErrorAction SilentlyContinue } else { "" }
+              $errText = if (Test-Path $playitErr) { Get-Content -Path $playitErr -Raw -ErrorAction SilentlyContinue } else { "" }
+              $cleanText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
 
-              if ($combined -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
-                  $domain = $matches[1]
+              if ($cleanText -match "(https://playit\.gg/claim/[a-zA-Z0-9_\-]+)") {
+                  $claimUrl =$matches[1]
                   break
               }
               Start-Sleep -Seconds 1
           }
 
-          if ($domain) {
+          if ($claimUrl) {
               Write-Host ""
               Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ">>> CLOUDFLARE RDP READY <<<" -ForegroundColor Cyan
-              Write-Host "Domain   : $domain" -ForegroundColor Yellow
-              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
-              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
+              Write-Host ">>> PLAYIT RDP TUNNEL STARTED <<<" -ForegroundColor Cyan
+              Write-Host "Claim Link: $claimUrl" -ForegroundColor Yellow
+              Write-Host "Username  : CynetAdmin" -ForegroundColor Yellow
+              Write-Host "Password  : Cynet@2026" -ForegroundColor Yellow
               Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ""
-              Write-Host "Run this on your PC:" -ForegroundColor Magenta
-              Write-Host "cloudflared access rdp --hostname $domain --url rdp://localhost:13389" -ForegroundColor White
-              Write-Host "Then connect mstsc to: localhost:13389" -ForegroundColor Magenta
+              Write-Host "1. Open the claim link above in your browser." -ForegroundColor White
+              Write-Host "2. Add a tunnel for TCP port 3389 (RDP)." -ForegroundColor White
+              Write-Host "3. Connect directly via mstsc to the generated Playit address." -ForegroundColor White
           } else {
-              Write-Host "[!] Failed to get Cloudflare tunnel URL." -ForegroundColor Red
-              if (Test-Path $cfErr) { Get-Content $cfErr }
+              Write-Host "[!] Could not fetch Playit claim URL within timeout." -ForegroundColor Red
+              if (Test-Path $playitOut) { Write-Host "--- STDOUT ---"; Get-Content $playitOut }
+              if (Test-Path $playitErr) { Write-Host "--- STDERR ---"; Get-Content $playitErr }
               exit 1
           }
 
       # ----------------------------------------------------------------------
-      # 5. Keep Alive
+      # ۵. زنده نگه داشتن نشست سرور
       # ----------------------------------------------------------------------
       - name: 5. Keep Alive
         shell: powershell
