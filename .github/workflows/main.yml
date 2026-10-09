@@ -6,12 +6,11 @@ on:
       tunnel_provider:
         description: 'Choose Tunnel Provider'
         required: true
-        default: 'bore'
+        default: 'pinggy'
         type: choice
         options:
-          - 'bore'
+          - 'pinggy'
           - 'cloudflare'
-          - 'localhost_run'
 
 jobs:
   build:
@@ -34,20 +33,19 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
 
-      # -------------------------------------------------------------
-      # گزینه ۱: Bore Tunnel (متن‌باز، بدون نیاز به نرم‌افزار روی کلاینت)
-      # -------------------------------------------------------------
-      - name: 2. Launch Bore Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'bore' }}
+      # ----------------------------------------------------------------------
+      # گزینه ۱: Pinggy (اتصال مستقیم TCP بدون نیاز به کلاینت اضافی روی کامپیوتر شما)
+      # ----------------------------------------------------------------------
+      - name: 2. Launch Pinggy TCP Tunnel (Direct MSTSC)
+        if: ${{ github.event.inputs.tunnel_provider == 'pinggy' }}
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip" -OutFile "C:\bore.zip"
-          Expand-Archive -Path "C:\bore.zip" -DestinationPath "C:\" -Force
-
-          $boreLog = "C:\bore.log"
+          $logFile = "C:\pinggy.log"
+          
+          # اجرای SSH Reverse Tunnel اختصاصی برای پورت 3389
           $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "C:\bore.exe"
-          $psi.Arguments = "local 3389 --to bore.pub"
+          $psi.FileName = "ssh"
+          $psi.Arguments = "-p 443 -o StrictHostKeyChecking=no -R 0:localhost:3389 tcp@a.pinggy.io"
           $psi.RedirectStandardError = $true
           $psi.RedirectStandardOutput = $true
           $psi.UseShellExecute = $false
@@ -58,7 +56,7 @@ jobs:
 
           $action = {
               if ($Event.SourceEventArgs.Data) {
-                  Add-Content -Path $boreLog -Value $Event.SourceEventArgs.Data
+                  Add-Content -Path $logFile -Value $Event.SourceEventArgs.Data
               }
           }
           Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
@@ -68,44 +66,44 @@ jobs:
           $process.BeginOutputReadLine()
           $process.BeginErrorReadLine()
 
-          Write-Host "Waiting for Bore port assignment..."
-          $port = $null
-          $timeout = [DateTime]::Now.AddSeconds(30)
+          Write-Host "Waiting for Pinggy direct TCP address..."
+          $directUrl = $null
+          $timeout = [DateTime]::Now.AddSeconds(45)
 
           while ([DateTime]::Now -lt $timeout) {
-              if (Test-Path $boreLog) {
-                  $text = [System.IO.File]::ReadAllText($boreLog)
-                  $match = [System.Text.RegularExpressions.Regex]::Match($text, "bore\.pub:(\d+)")
-                  if ($match.Success) {
-                      $port = $match.Groups[1].Value
+              if (Test-Path $logFile) {
+                  $content = [System.IO.File]::ReadAllText($logFile)
+                  # خروجی پینگلی به فرمت tcp://free.pinggy.link:XXXXX است
+                  if ($content -match "tcp://([a-zA-Z0-9\.\-]+:\d+)") {
+                      $directUrl = $matches[1]
                       break
                   }
               }
               Start-Sleep -Milliseconds 400
           }
 
-          if ($port) {
+          if ($directUrl) {
               Write-Host ""
               Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ">>> BORE DIRECT RDP READY <<<" -ForegroundColor Cyan
-              Write-Host "Direct Address : bore.pub:$port" -ForegroundColor Yellow
+              Write-Host ">>> DIRECT RDP IS READY (PINGGY) <<<" -ForegroundColor Cyan
+              Write-Host "Direct Address : $directUrl" -ForegroundColor Yellow
               Write-Host "Username       : CynetAdmin" -ForegroundColor Yellow
               Write-Host "Password       : Cynet@2026" -ForegroundColor Yellow
               Write-Host "==================================================" -ForegroundColor Green
               Write-Host ""
-              Write-Host "NO EXTRA CLIENT SOFTWARE NEEDED!" -ForegroundColor Cyan
-              Write-Host "Open mstsc (Remote Desktop) on your PC and connect to:" -ForegroundColor Magenta
-              Write-Host "bore.pub:$port" -ForegroundColor White
+              Write-Host "NO EXTRA SOFTWARE NEEDED!" -ForegroundColor Cyan
+              Write-Host "Just open Remote Desktop Connection (mstsc) and connect to:" -ForegroundColor Magenta
+              Write-Host "$directUrl" -ForegroundColor White
               Write-Host ""
           } else {
-              Write-Host "[!] Could not fetch Bore port." -ForegroundColor Red
-              if (Test-Path $boreLog) { Get-Content $boreLog }
+              Write-Host "[!] Could not extract Pinggy connection details." -ForegroundColor Red
+              if (Test-Path $logFile) { Get-Content $logFile }
               exit 1
           }
 
-      # -------------------------------------------------------------
-      # گزینه ۲: Cloudflare Tunnel (رمزگذاری شده، شبکه پایدار)
-      # -------------------------------------------------------------
+      # ----------------------------------------------------------------------
+      # گزینه ۲: Cloudflare Tunnel (پایدار با cloudflared روی سیستم)
+      # ----------------------------------------------------------------------
       - name: 3. Launch Cloudflare Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
         shell: powershell
@@ -170,79 +168,10 @@ jobs:
               exit 1
           }
 
-      # -------------------------------------------------------------
-      # گزینه ۳: Localhost.run (معماری OpenSSH استاندارد بدون فایل اجرایی اضافی)
-      # -------------------------------------------------------------
-      - name: 4. Launch Localhost.run Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'localhost_run' }}
-        shell: powershell
-        run: |
-          $sshLog = "C:\ssh_tunnel.log"
-          # ساخت یک کلید موقت SSH برای اتصال بدون پسورد
-          ssh-keygen -t ed25519 -N "" -f "$HOME\.ssh\id_ed25519" -q
-
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "ssh"
-          $psi.Arguments = "-o StrictHostKeyChecking=no -R 80:localhost:3389 nokey@localhost.run"
-          $psi.RedirectStandardError = $true
-          $psi.RedirectStandardOutput = $true
-          $psi.UseShellExecute = $false
-          $psi.CreateNoWindow = $true
-
-          $process = New-Object System.Diagnostics.Process
-          $process.StartInfo = $psi
-
-          $action = {
-              if ($Event.SourceEventArgs.Data) {
-                  Add-Content -Path $sshLog -Value $Event.SourceEventArgs.Data
-              }
-          }
-          Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
-          Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
-
-          $process.Start() | Out-Null
-          $process.BeginOutputReadLine()
-          $process.BeginErrorReadLine()
-
-          Write-Host "Waiting for Localhost.run host..."
-          $endpoint = $null
-          $timeout = [DateTime]::Now.AddSeconds(45)
-
-          while ([DateTime]::Now -lt $timeout) {
-              if (Test-Path $sshLog) {
-                  $text = [System.IO.File]::ReadAllText($sshLog)
-                  $match = [System.Text.RegularExpressions.Regex]::Match($text, "([a-zA-Z0-9-]+\.lhr\.life)")
-                  if ($match.Success) {
-                      $endpoint = $match.Groups[1].Value
-                      break
-                  }
-              }
-              Start-Sleep -Milliseconds 500
-          }
-
-          if ($endpoint) {
-              Write-Host ""
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ">>> LOCALHOST.RUN RDP READY <<<" -ForegroundColor Cyan
-              Write-Host "Endpoint : $endpoint" -ForegroundColor Yellow
-              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
-              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ""
-              Write-Host "Forward locally on your PC via PowerShell:" -ForegroundColor Magenta
-              Write-Host "ssh -N -L 13389:$($endpoint):80 nokey@localhost.run" -ForegroundColor White
-              Write-Host "Then connect mstsc to: localhost:13389" -ForegroundColor Magenta
-              Write-Host ""
-          } else {
-              Write-Host "[!] Could not fetch localhost.run endpoint." -ForegroundColor Red
-              if (Test-Path $sshLog) { Get-Content $sshLog }
-              exit 1
-          }
-
-      # -------------------------------------------------------------
-      # ۵. زنده نگه داشتن سرور
-      # -------------------------------------------------------------
-      - name: 5. Keep Alive
+      # ----------------------------------------------------------------------
+      # 4. زنده نگه داشتن سرور
+      # ----------------------------------------------------------------------
+      - name: 4. Keep Alive
         shell: powershell
         run: |
           for ($i = 1; $i -le 350; $i++) {
