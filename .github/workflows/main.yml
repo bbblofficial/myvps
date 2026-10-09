@@ -12,13 +12,13 @@ jobs:
       - name: Configure RDP, User & Cloudflare Tunnel
         shell: powershell
         run: |
-          # 1. فعال‌سازی RDP و تنظیمات فایروال
+          # 1. فعال‌سازی RDP و پورت فایروال
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
 
-          # 2. ساخت حساب کاربری مدیر
+          # 2. ایجاد کاربر ادمین برای ورود
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           if (-not (Get-LocalUser -Name "CynetAdmin" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires
@@ -26,15 +26,15 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
 
-          # 3. دانلود ابزار رسمی Cloudflared
+          # 3. دانلود باینری رسمی cloudflared
           $cfPath = "C:\cloudflared.exe"
           $logErr = "C:\cf_err.log"
           $logOut = "C:\cf_out.log"
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfPath
 
-          # 4. اجرای پروسه در پس‌زمینه با ارجاع دقیق استریم‌ها
+          # 4. اجرای پروسه کلودفلر در پس‌زمینه
           $cfProcess = Start-Process -FilePath$cfPath `
-            -ArgumentList "tunnel --url rdp://localhost:3389 --no-autoupdate" `
+            -ArgumentList "tunnel --url tcp://localhost:3389 --no-autoupdate" `
             -RedirectStandardError $logErr `
             -RedirectStandardOutput $logOut `
             -PassThru
@@ -42,7 +42,7 @@ jobs:
           Write-Host "Waiting for TryCloudflare Tunnel initialization..."
           $domain = $null$timeout = [DateTime]::Now.AddSeconds(60)
 
-          # بررسی بلادرنگ فایل لاگ برای استخراج دامنه
+          # بررسی لاگ تا زمان دریافت دامنه اختصاصی
           while ([DateTime]::Now -lt $timeout) {
               if (Test-Path $logErr) {
                   $rawLog = [System.IO.File]::ReadAllText($logErr)
@@ -55,7 +55,7 @@ jobs:
               Start-Sleep -Milliseconds 500
           }
 
-          # 5. نمایش مشخصات اتصال به محض دریافت دامنه
+          # 5. چاپ اطلاعات ورود در صورت موفقیت
           if ($domain) {
               Write-Host ""
               Write-Host "==================================================" -ForegroundColor Green
@@ -73,15 +73,19 @@ jobs:
               Write-Host ""
           } else {
               Write-Host "[!] Failed to retrieve Cloudflare tunnel domain." -ForegroundColor Red
-              if (Test-Path $logErr) { Get-Content$logErr }
+              if (Test-Path $logErr) { 
+                  Get-Content $logErr 
+              }
               exit 1
           }
 
-          # 6. زنده نگه داشتن سرور و پروسه به مدت 6 ساعت
+          # 6. زنده نگه داشتن سرور به مدت 6 ساعت
           for ($i = 1; $i -le 350; $i++) {
               if ($cfProcess.HasExited) {
                   Write-Host "[!] Cloudflared terminated unexpectedly." -ForegroundColor Red
-                  if (Test-Path $logErr) { Get-Content$logErr }
+                  if (Test-Path $logErr) { 
+                      Get-Content $logErr 
+                  }
                   exit 1
               }
               Start-Sleep -Seconds 60
