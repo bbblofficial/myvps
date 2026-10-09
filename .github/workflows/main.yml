@@ -9,18 +9,14 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: 1. Enable Remote Desktop
+      - name: 1. Configure RDP and Admin Account
         shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
-          Start-Sleep -Seconds 5
 
-      - name: 2. Create Admin Account
-        shell: powershell
-        run: |
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           if (-not (Get-LocalUser -Name "CynetAdmin" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires
@@ -28,62 +24,50 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
 
-      - name: 3. Setup and Run Cloudflare Tunnel
+      - name: 2. Launch Tunnel & Keep Alive
         shell: powershell
         run: |
-          # Download cloudflared binary
-          $cfPath = "C:\cloudflared.exe"
-          $logPath = "C:\cloudflared.log"
-          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfPath
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
-          # cloudflared writes runtime output and quick-tunnel URLs to STDERR
-          Start-Process -FilePath $cfPath `
-            -ArgumentList "tunnel --url tcp://localhost:3389 --no-autoupdate" `
-            -RedirectStandardError $logPath `
-            -RedirectStandardOutput "C:\cloudflared_out.log" `
-            -WindowStyle Hidden
+          # اجرای cloudflared در قالب یک Job محلی تا توسط گیت‌هاب بسته نشود
+          $job = Start-Job -ScriptBlock {
+              & "C:\cloudflared.exe" tunnel --url rdp://localhost:3389 --no-autoupdate 2>&1
+          }
 
-          Write-Host "Waiting for Cloudflare Tunnel to initialize..."
-          $hostname = $null
+          $domain = $null
+          $timeout = [DateTime]::Now.AddSeconds(60)
 
-          for ($i = 1; $i -le 40; $i++) {
-              Start-Sleep -Seconds 2
-              if (Test-Path $logPath) {
-                  $content = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-                  # Capture the naked trycloudflare.com domain name
-                  if ($content -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
-                      $hostname = $matches[1]
-                      break
-                  }
+          # دریافت خروجی زنده تا زمان پیدا شدن دامنه
+          while ([DateTime]::Now -lt $timeout) {
+              $output = Receive-Job -Job $job -Keep
+              if ($output -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
+                  $domain = $Matches[1]
+                  break
               }
-              Write-Host "  Checking status... ($i/40)"
+              Start-Sleep -Milliseconds 500
           }
 
-          Write-Host "`n==================================================" -ForegroundColor Green
-          if ($hostname) {
-              Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-              Write-Host "  Hostname : $hostname" -ForegroundColor Yellow
-              Write-Host "  Username : CynetAdmin" -ForegroundColor Yellow
-              Write-Host "  Password : Cynet@2026" -ForegroundColor Yellow
+          if ($domain) {
               Write-Host ""
-              Write-Host "  == HOW TO CONNECT ==" -ForegroundColor Magenta
-              Write-Host "  1. Install cloudflared on your local machine." -ForegroundColor Magenta
-              Write-Host "  2. Run this command in your local terminal:" -ForegroundColor Magenta
-              Write-Host "     cloudflared access rdp --hostname $hostname --url rdp://localhost:13389" -ForegroundColor White
-              Write-Host "  3. Open Remote Desktop Connection (mstsc) and connect to:" -ForegroundColor Magenta
-              Write-Host "     localhost:13389" -ForegroundColor White
+              Write-Host "==================================================" -ForegroundColor Green
+              Write-Host ">>> RDP READY! DOMAIN DETECTED <<<" -ForegroundColor Cyan
+              Write-Host "Domain   : $domain" -ForegroundColor Yellow
+              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
+              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
+              Write-Host "==================================================" -ForegroundColor Green
+              Write-Host ""
+              Write-Host "Command for your PC:" -ForegroundColor Magenta
+              Write-Host "cloudflared access rdp --hostname $domain --url rdp://localhost:13389" -ForegroundColor White
+              Write-Host ""
           } else {
-              Write-Host "  [!] Failed to retrieve Cloudflare Tunnel URL." -ForegroundColor Red
-              Write-Host "--- Cloudflared Log Dump ---"
-              Get-Content $logPath -ErrorAction SilentlyContinue
+              Write-Host "[!] Could not detect trycloudflare domain." -ForegroundColor Red
+              Receive-Job -Job $job
+              Stop-Job -Job $job
+              exit 1
           }
-          Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 4. Keep Alive
-        shell: powershell
-        run: |
-          $maxMinutes = 350
-          for ($i = 1; $i -le $maxMinutes; $i++) {
+          # نگه داشتن استپ تا پایان زمان مجاز بدون قطع شدن تونل
+          for ($i = 1; $i -le 350; $i++) {
               Start-Sleep -Seconds 60
-              Write-Host "[$i/$maxMinutes min] Runner active and listening..."
+              Write-Host "[$i/350 min] Runner alive..."
           }
