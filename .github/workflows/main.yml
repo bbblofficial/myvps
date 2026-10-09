@@ -1,16 +1,7 @@
-name: Windows Cloud RDP (Multi-Tunnel Selector)
+name: Windows Cloud RDP via Cloudflare Tunnel
 
 on:
   workflow_dispatch:
-    inputs:
-      tunnel_provider:
-        description: 'Choose Tunnel Provider'
-        required: true
-        default: 'cloudflare'
-        type: choice
-        options:
-          - 'cloudflare'
-          - 'bore'
 
 jobs:
   build:
@@ -18,14 +9,16 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: 1. Configure RDP and Admin Account
+      - name: Configure RDP, User & Cloudflare Tunnel
         shell: powershell
         run: |
+          # 1. فعال‌سازی RDP و تنظیمات فایروال
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
 
+          # 2. ساخت حساب کاربری مدیر
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           if (-not (Get-LocalUser -Name "CynetAdmin" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires
@@ -33,151 +26,64 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
 
-      # ---------------------------------------------------------
-      # گزینه اول: Cloudflare Tunnel
-      # ---------------------------------------------------------
-      - name: 2. Setup Cloudflare Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
-        shell: powershell
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
+          # 3. دانلود ابزار رسمی Cloudflared
+          $cfPath = "C:\cloudflared.exe"
+          $logErr = "C:\cf_err.log"
+          $logOut = "C:\cf_out.log"
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfPath
 
-          $logFile = "C:\cf_output.log"
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "C:\cloudflared.exe"
-          $psi.Arguments = "tunnel --url tcp://localhost:3389 --no-autoupdate"
-          $psi.RedirectStandardError = $true
-          $psi.RedirectStandardOutput = $true
-          $psi.UseShellExecute = $false
-          $psi.CreateNoWindow = $true
+          # 4. اجرای پروسه در پس‌زمینه با ارجاع دقیق استریم‌ها
+          $cfProcess = Start-Process -FilePath$cfPath `
+            -ArgumentList "tunnel --url rdp://localhost:3389 --no-autoupdate" `
+            -RedirectStandardError $logErr `
+            -RedirectStandardOutput $logOut `
+            -PassThru
 
-          $process = New-Object System.Diagnostics.Process
-          $process.StartInfo = $psi
+          Write-Host "Waiting for TryCloudflare Tunnel initialization..."
+          $domain = $null$timeout = [DateTime]::Now.AddSeconds(60)
 
-          $action = {
-              if ($Event.SourceEventArgs.Data) {
-                  Add-Content -Path $logFile -Value $Event.SourceEventArgs.Data
-              }
-          }
-          Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
-          Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
-
-          $process.Start() | Out-Null
-          $process.BeginOutputReadLine()
-          $process.BeginErrorReadLine()
-
-          Write-Host "Waiting for Cloudflare URL..."
-          $domain = $null
-          $timeout = [DateTime]::Now.AddSeconds(60)
-
+          # بررسی بلادرنگ فایل لاگ برای استخراج دامنه
           while ([DateTime]::Now -lt $timeout) {
-              if (Test-Path $logFile) {
-                  $text = [System.IO.File]::ReadAllText($logFile)
-                  $match = [System.Text.RegularExpressions.Regex]::Match($text, "https://([a-zA-Z0-9-]+\.trycloudflare\.com)")
+              if (Test-Path $logErr) {
+                  $rawLog = [System.IO.File]::ReadAllText($logErr)
+                  $match = [System.Text.RegularExpressions.Regex]::Match($rawLog, "https://([a-zA-Z0-9-]+\.trycloudflare\.com)")
                   if ($match.Success) {
-                      $domain = $match.Groups[1].Value
+                      $domain =$match.Groups[1].Value
                       break
                   }
               }
-              Start-Sleep -Milliseconds 400
+              Start-Sleep -Milliseconds 500
           }
 
+          # 5. نمایش مشخصات اتصال به محض دریافت دامنه
           if ($domain) {
               Write-Host ""
               Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ">>> CLOUDFLARE RDP READY <<<" -ForegroundColor Cyan
+              Write-Host ">>> CLOUDFLARE RDP READY! <<<" -ForegroundColor Cyan
               Write-Host "Domain   : $domain" -ForegroundColor Yellow
               Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
               Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
               Write-Host "==================================================" -ForegroundColor Green
               Write-Host ""
-              Write-Host "Run this on your PC:" -ForegroundColor Magenta
-              Write-Host "cloudflared access rdp --hostname $domain --url rdp://localhost:13389" -ForegroundColor White
-              Write-Host "Then connect mstsc to: localhost:13389" -ForegroundColor Magenta
+              Write-Host "Step 1: Run this command in CMD / PowerShell on your PC:" -ForegroundColor Magenta
+              Write-Host "cloudflared access rdp --hostname $domain --url localhost:13389" -ForegroundColor White
+              Write-Host ""
+              Write-Host "Step 2: Open Remote Desktop Connection (mstsc) and connect to:" -ForegroundColor Magenta
+              Write-Host "localhost:13389" -ForegroundColor White
               Write-Host ""
           } else {
-              Write-Host "[!] Could not fetch domain." -ForegroundColor Red
+              Write-Host "[!] Failed to retrieve Cloudflare tunnel domain." -ForegroundColor Red
+              if (Test-Path $logErr) { Get-Content$logErr }
               exit 1
           }
 
-      # ---------------------------------------------------------
-      # گزینه دوم: Bore (متن‌باز، TCP مستقیم بدون نیاز به کلاینت اضافی)
-      # ---------------------------------------------------------
-      - name: 3. Setup Bore Tunnel (Open Source & No-Client Needed)
-        if: ${{ github.event.inputs.tunnel_provider == 'bore' }}
-        shell: powershell
-        run: |
-          # دانلود کامپوننت متن‌باز bore
-          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip" -OutFile "C:\bore.zip"
-          Expand-Archive -Path "C:\bore.zip" -DestinationPath "C:\" -Force
-
-          $boreLog = "C:\bore.log"
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "C:\bore.exe"
-          $psi.Arguments = "local 3389 --to bore.pub"
-          $psi.RedirectStandardError = $true
-          $psi.RedirectStandardOutput = $true
-          $psi.UseShellExecute = $false
-          $psi.CreateNoWindow = $true
-
-          $process = New-Object System.Diagnostics.Process
-          $process.StartInfo = $psi
-
-          $action = {
-              if ($Event.SourceEventArgs.Data) {
-                  Add-Content -Path $boreLog -Value $Event.SourceEventArgs.Data
-              }
-          }
-          Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
-          Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
-
-          $process.Start() | Out-Null
-          $process.BeginOutputReadLine()
-          $process.BeginErrorReadLine()
-
-          Write-Host "Waiting for Bore port assignment..."
-          $port = $null
-          $timeout = [DateTime]::Now.AddSeconds(30)
-
-          while ([DateTime]::Now -lt $timeout) {
-              if (Test-Path $boreLog) {
-                  $text = [System.IO.File]::ReadAllText($boreLog)
-                  # نمونه خروجی: listening at bore.pub:12345
-                  $match = [System.Text.RegularExpressions.Regex]::Match($text, "bore\.pub:(\d+)")
-                  if ($match.Success) {
-                      $port = $match.Groups[1].Value
-                      break
-                  }
-              }
-              Start-Sleep -Milliseconds 400
-          }
-
-          if ($port) {
-              Write-Host ""
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ">>> BORE DIRECT RDP READY <<<" -ForegroundColor Cyan
-              Write-Host "Address  : bore.pub:$port" -ForegroundColor Yellow
-              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
-              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ""
-              Write-Host "NO EXTRA SOFTWARE NEEDED!" -ForegroundColor Cyan
-              Write-Host "Just open Remote Desktop Connection (mstsc) and connect directly to:" -ForegroundColor Magenta
-              Write-Host "bore.pub:$port" -ForegroundColor White
-              Write-Host ""
-          } else {
-              Write-Host "[!] Could not fetch Bore port." -ForegroundColor Red
-              if (Test-Path $boreLog) { Get-Content $boreLog }
-              exit 1
-          }
-
-      # ---------------------------------------------------------
-      # زنده نگه داشتن سیستم
-      # ---------------------------------------------------------
-      - name: 4. Keep Alive
-        shell: powershell
-        run: |
+          # 6. زنده نگه داشتن سرور و پروسه به مدت 6 ساعت
           for ($i = 1; $i -le 350; $i++) {
+              if ($cfProcess.HasExited) {
+                  Write-Host "[!] Cloudflared terminated unexpectedly." -ForegroundColor Red
+                  if (Test-Path $logErr) { Get-Content$logErr }
+                  exit 1
+              }
               Start-Sleep -Seconds 60
-              Write-Host "[$i/350 min] Runner listening..."
+              Write-Host "[$i/350 min] Runner & Tunnel Active..."
           }
