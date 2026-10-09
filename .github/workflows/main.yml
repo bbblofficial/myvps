@@ -1,27 +1,23 @@
-name: Windows Cloud RDP Multi-Tunnel
+name: Windows Cloud RDP - Free Tunnel Multi-Options (No Auth Required)
 
 on:
   workflow_dispatch:
     inputs:
       tunnel_provider:
-        description: 'Choose Tunnel Provider'
+        description: 'Choose Tunnel Provider (All Free - No API Keys Needed)'
         required: true
-        default: 'cloudflare'
+        default: 'pinggy-free'
         type: choice
         options:
+          - 'pinggy-free'
           - 'cloudflare'
-          - 'pinggy-key'
-          - 'ngrok'
+          - 'localtunnel'
+          - 'playit-free'
 
 jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 360
-    
-    # Add secrets to the environment
-    env:
-      PINGGY_KEY: ${{ secrets.PINGGY_KEY }}
-      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
 
     steps:
       # ======================================================================
@@ -30,6 +26,7 @@ jobs:
       - name: 1. Setup RDP and User
         shell: powershell
         run: |
+          Write-Host "Setting up Remote Desktop..." -ForegroundColor Cyan;
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0;
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0;
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop";
@@ -42,7 +39,7 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue;
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue;
 
-          Write-Host "Verifying RDP Port 3389...";
+          Write-Host "Verifying RDP Port 3389..." -ForegroundColor Yellow;
           $portReady = $false;
           for ($i = 0; $i -lt 15; $i++) {
               $check = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue;
@@ -59,33 +56,162 @@ jobs:
           }
 
       # ======================================================================
-      # Option 1: Cloudflare TryCloudflare (NO AUTH REQUIRED - RECOMMENDED)
-      # Free, no setup needed, works in CI/CD without credentials
+      # Option 1: Pinggy Free (NO AUTH - Completely Free)
+      # SSH tunnel to free.pinggy.io - Works without any API keys or registration
       # ======================================================================
-      - name: 2. Launch Cloudflare Tunnel (No Auth Required)
+      - name: 2a. Launch Pinggy Free Tunnel (SSH to free.pinggy.io)
+        if: ${{ github.event.inputs.tunnel_provider == 'pinggy-free' }}
+        shell: powershell
+        run: |
+          Write-Host "=====================================================" -ForegroundColor Green;
+          Write-Host "Starting Pinggy Free SSH Tunnel" -ForegroundColor Cyan;
+          Write-Host "=====================================================" -ForegroundColor Green;
+          Write-Host "Endpoint: free.pinggy.io (No API key required)" -ForegroundColor Yellow;
+          Write-Host "Method: SSH reverse tunnel with TCP protocol" -ForegroundColor Yellow;
+          Write-Host "";
+
+          $logOut = "C:\pinggy_free_out.log";
+          $logErr = "C:\pinggy_free_err.log";
+          if (Test-Path $logOut) { Remove-Item $logOut -Force; }
+          if (Test-Path $logErr) { Remove-Item $logErr -Force; }
+
+          Write-Host "Establishing SSH connection to free.pinggy.io..." -ForegroundColor Cyan;
+          # SSH to Pinggy free with TCP protocol - no authentication needed
+          # -p 443: Use port 443 (SSH over HTTPS)
+          # -R 0:localhost:3389: Remote port forward from Pinggy to local RDP
+          # tcp@free.pinggy.io: TCP protocol variant on Pinggy free service
+          $sshArgs = "-p 443 -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ServerAliveInterval=30 -L 4300:127.0.0.1:4300 -R 0:127.0.0.1:3389 tcp@free.pinggy.io";
+          $proc = Start-Process -FilePath "ssh" -ArgumentList $sshArgs -RedirectStandardOutput $logOut -RedirectStandardError $logErr -NoNewWindow -PassThru;
+
+          Write-Host "Waiting for tunnel address from Pinggy..." -ForegroundColor Yellow;
+          $tunnelAddr = $null;
+          $timeout = [DateTime]::Now.AddSeconds(90);
+          $attempts = 0;
+
+          while ([DateTime]::Now -lt $timeout) {
+              $attempts++;
+              if ($proc.HasExited) {
+                  Write-Host "SSH process exited with code: $($proc.ExitCode)" -ForegroundColor Red;
+                  Write-Host "" -ForegroundColor Red;
+                  Write-Host "=== SSH ERROR OUTPUT ===" -ForegroundColor Red;
+                  if (Test-Path $logErr) { Get-Content $logErr; }
+                  Write-Host "========================" -ForegroundColor Red;
+                  exit 1;
+              }
+
+              # Try Pinggy web debugger API on localhost
+              try {
+                  $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4300/urls" -TimeoutSec 1 -ErrorAction SilentlyContinue;
+                  if ($resp -and $resp.tcp) {
+                      $tunnelAddr = $resp.tcp -replace '^tcp://', '';
+                      Write-Host "Tunnel address received from Pinggy API!" -ForegroundColor Green;
+                      break;
+                  }
+              } catch {}
+
+              # Parse output files for tunnel address
+              $outText = if (Test-Path $logOut) { Get-Content -Path $logOut -Raw -ErrorAction SilentlyContinue } else { "" };
+              $errText = if (Test-Path $logErr) { Get-Content -Path $logErr -Raw -ErrorAction SilentlyContinue } else { "" };
+              $fullText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', '';
+
+              # Match various Pinggy address formats
+              if ($fullText -match "tcp://([a-zA-Z0-9\.\-]+:\d+)") {
+                  $tunnelAddr = $matches[1];
+                  Write-Host "Tunnel address found in output!" -ForegroundColor Green;
+                  break;
+              } elseif ($fullText -match "([a-zA-Z0-9\.\-]+\.free\.pinggy\.link:\d+)") {
+                  $tunnelAddr = $matches[1];
+                  break;
+              } elseif ($fullText -match "([a-zA-Z0-9\.\-]+\.a\.free\.pinggy\.io:\d+)") {
+                  $tunnelAddr = $matches[1];
+                  break;
+              }
+
+              if ($attempts % 10 -eq 0) {
+                  Write-Host "[Waiting...] Attempt $attempts/90 seconds" -ForegroundColor Gray;
+              }
+              Start-Sleep -Seconds 1;
+          }
+
+          if ($tunnelAddr) {
+              Write-Host "";
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host "✓ PINGGY FREE RDP TUNNEL ACTIVE" -ForegroundColor Cyan;
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host "Tunnel Address  : $tunnelAddr" -ForegroundColor Yellow;
+              Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow;
+              Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow;
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host "Connection Method:" -ForegroundColor Magenta;
+              Write-Host "  1. Open Remote Desktop (mstsc)" -ForegroundColor White;
+              Write-Host "  2. Connect to: $tunnelAddr" -ForegroundColor White;
+              Write-Host "  3. Username: CynetAdmin" -ForegroundColor White;
+              Write-Host "  4. Password: Cynet@2026" -ForegroundColor White;
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host "⚠️  NOTE: Pinggy free has 60-minute timeout" -ForegroundColor Yellow;
+              Write-Host "If disconnected, simply restart the workflow" -ForegroundColor Yellow;
+          } else {
+              Write-Host "[✗] Could not get Pinggy tunnel address" -ForegroundColor Red;
+              Write-Host "" -ForegroundColor Red;
+              Write-Host "=== SSH OUTPUT ===" -ForegroundColor Red;
+              if (Test-Path $logOut) { 
+                  Write-Host "--- STDOUT ---" -ForegroundColor Red;
+                  Get-Content $logOut;
+              }
+              if (Test-Path $logErr) { 
+                  Write-Host "--- STDERR ---" -ForegroundColor Red;
+                  Get-Content $logErr;
+              }
+              Write-Host "==================" -ForegroundColor Red;
+              Write-Host "" -ForegroundColor Yellow;
+              Write-Host "Troubleshooting:" -ForegroundColor Yellow;
+              Write-Host "  • Check if SSH client is installed" -ForegroundColor White;
+              Write-Host "  • Verify network connectivity" -ForegroundColor White;
+              Write-Host "  • Try workflow again (Pinggy might be busy)" -ForegroundColor White;
+              exit 1;
+          }
+
+      # ======================================================================
+      # Option 2: Cloudflare TryCloudflare (NO AUTH - Fastest)
+      # ======================================================================
+      - name: 2b. Launch Cloudflare TryCloudflare Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
         shell: powershell
         run: |
+          Write-Host "=====================================================" -ForegroundColor Green;
+          Write-Host "Starting Cloudflare TryCloudflare Tunnel" -ForegroundColor Cyan;
+          Write-Host "=====================================================" -ForegroundColor Green;
+          Write-Host "Endpoint: Cloudflare TryCloudflare (No registration)" -ForegroundColor Yellow;
+          Write-Host "Method: cloudflared with HTTP/2 protocol" -ForegroundColor Yellow;
+          Write-Host "";
+
           Write-Host "Downloading cloudflared..." -ForegroundColor Cyan;
-          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe";
-          
+          try {
+              Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe" -ErrorAction Stop;
+              Write-Host "cloudflared downloaded successfully" -ForegroundColor Green;
+          } catch {
+              Write-Host "Failed to download cloudflared: $_" -ForegroundColor Red;
+              exit 1;
+          }
+
           $logFile = "C:\cloudflared.log";
           if (Test-Path $logFile) { Remove-Item $logFile -Force; }
 
-          # HTTP/2 protocol avoids UDP/QUIC blockage on GitHub Actions
-          Write-Host "Starting Cloudflare tunnel (TryCloudflare)..." -ForegroundColor Cyan;
-          $cfArgs = "tunnel --url tcp://localhost:3389 --protocol http2 --logfile $logFile --no-autoupdate";
+          Write-Host "Starting cloudflared tunnel..." -ForegroundColor Cyan;
+          $cfArgs = "tunnel --url tcp://127.0.0.1:3389 --protocol http2 --logfile $logFile --no-autoupdate";
           $proc = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $cfArgs -NoNewWindow -PassThru;
 
-          Write-Host "Waiting for TryCloudflare URL..." -ForegroundColor Yellow;
-          $domain = $null;
+          Write-Host "Waiting for Cloudflare tunnel URL..." -ForegroundColor Yellow;
+          $cfDomain = $null;
           $timeout = [DateTime]::Now.AddSeconds(60);
+          $attempts = 0;
 
           while ([DateTime]::Now -lt $timeout) {
+              $attempts++;
               if ($proc.HasExited) {
                   Write-Host "Cloudflared process terminated with code: $($proc.ExitCode)" -ForegroundColor Red;
                   if (Test-Path $logFile) {
-                      Write-Host "--- LOG ---";
+                      Write-Host "=== CLOUDFLARED LOG ===" -ForegroundColor Red;
                       Get-Content $logFile;
                   }
                   exit 1;
@@ -94,200 +220,233 @@ jobs:
               if (Test-Path $logFile) {
                   $content = Get-Content -Path $logFile -Raw -ErrorAction SilentlyContinue;
                   if ($content -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
-                      $domain = $matches[1];
+                      $cfDomain = $matches[1];
+                      Write-Host "Cloudflare tunnel established!" -ForegroundColor Green;
                       break;
                   }
+              }
+
+              if ($attempts % 10 -eq 0) {
+                  Write-Host "[Waiting...] Attempt $attempts/60 seconds" -ForegroundColor Gray;
               }
               Start-Sleep -Seconds 1;
           }
 
-          if ($domain) {
+          if ($cfDomain) {
               Write-Host "";
               Write-Host "==================================================" -ForegroundColor Green;
-              Write-Host ">>> CLOUDFLARE RDP READY <<<" -ForegroundColor Cyan;
-              Write-Host "Domain   : $domain" -ForegroundColor Yellow;
-              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow;
-              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow;
+              Write-Host "✓ CLOUDFLARE TUNNEL ACTIVE" -ForegroundColor Cyan;
               Write-Host "==================================================" -ForegroundColor Green;
-              Write-Host "";
-              Write-Host "[1] Run on your PC (requires cloudflared):" -ForegroundColor Magenta;
-              Write-Host "cloudflared access rdp --hostname $domain --url rdp://localhost:13389" -ForegroundColor White;
-              Write-Host "";
-              Write-Host "[2] Connect Remote Desktop (mstsc) to: localhost:13389" -ForegroundColor Magenta;
+              Write-Host "Tunnel Domain   : $cfDomain" -ForegroundColor Yellow;
+              Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow;
+              Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow;
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host "Connection Method (Requires cloudflared client):" -ForegroundColor Magenta;
+              Write-Host "  1. Install cloudflared on your PC" -ForegroundColor White;
+              Write-Host "  2. Run: cloudflared access rdp --hostname $cfDomain --url rdp://localhost:13389" -ForegroundColor White;
+              Write-Host "  3. Connect Remote Desktop to: localhost:13389" -ForegroundColor White;
+              Write-Host "  4. Username: CynetAdmin, Password: Cynet@2026" -ForegroundColor White;
               Write-Host "==================================================" -ForegroundColor Green;
           } else {
-              Write-Host "[!] Failed to get Cloudflare tunnel URL." -ForegroundColor Red;
+              Write-Host "[✗] Failed to get Cloudflare tunnel URL" -ForegroundColor Red;
               if (Test-Path $logFile) { Get-Content $logFile; }
               exit 1;
           }
 
       # ======================================================================
-      # Option 2: Pinggy (WITH API KEY - Requires PINGGY_KEY secret)
+      # Option 3: Localtunnel (NO AUTH - Open Source)
       # ======================================================================
-      - name: 3. Launch Pinggy Tunnel (With Authentication Key)
-        if: ${{ github.event.inputs.tunnel_provider == 'pinggy-key' }}
+      - name: 2c. Launch Localtunnel (Open Source)
+        if: ${{ github.event.inputs.tunnel_provider == 'localtunnel' }}
         shell: powershell
         run: |
-          # Verify Pinggy API key is configured
-          if (-not $env:PINGGY_KEY) {
-              Write-Host "[!] PINGGY_KEY secret is not configured!" -ForegroundColor Red;
-              Write-Host "Add PINGGY_KEY to GitHub repository secrets:" -ForegroundColor Yellow;
-              Write-Host "  1. Go to Settings > Secrets and variables > Actions" -ForegroundColor White;
-              Write-Host "  2. Click 'New repository secret'" -ForegroundColor White;
-              Write-Host "  3. Name: PINGGY_KEY" -ForegroundColor White;
-              Write-Host "  4. Value: Your Pinggy API key from https://pinggy.io" -ForegroundColor White;
-              exit 1;
+          Write-Host "=====================================================" -ForegroundColor Green;
+          Write-Host "Starting Localtunnel (Open Source)" -ForegroundColor Cyan;
+          Write-Host "=====================================================" -ForegroundColor Green;
+          Write-Host "Endpoint: Localtunnel (No registration required)" -ForegroundColor Yellow;
+          Write-Host "Method: Node.js based SSH tunnel" -ForegroundColor Yellow;
+          Write-Host "";
+
+          Write-Host "Checking Node.js installation..." -ForegroundColor Cyan;
+          $nodeVersion = node --version 2>$null;
+          if (-not $nodeVersion) {
+              Write-Host "Installing Node.js..." -ForegroundColor Yellow;
+              # Localtunnel requires Node.js, try to download portable version
+              Invoke-WebRequest -Uri "https://nodejs.org/dist/v20.11.1/node-v20.11.1-win-x64.zip" -OutFile "C:\node.zip" -ErrorAction SilentlyContinue;
+              if (Test-Path "C:\node.zip") {
+                  Expand-Archive -Path "C:\node.zip" -DestinationPath "C:\" -Force;
+                  $env:PATH = "C:\node-v20.11.1-win-x64;$env:PATH";
+              }
           }
 
-          $logOut = "C:\pinggy_out.log";
-          $logErr = "C:\pinggy_err.log";
-          if (Test-Path $logOut) { Remove-Item $logOut -Force; }
-          if (Test-Path $logErr) { Remove-Item $logErr -Force; }
+          Write-Host "Installing localtunnel..." -ForegroundColor Cyan;
+          npm install -g localtunnel 2>&1 | Out-Null;
 
-          Write-Host "Connecting to Pinggy with authentication..." -ForegroundColor Cyan;
-          # Use Pinggy token authentication instead of publickey
-          $sshArgs = "-p 443 -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ServerAliveInterval=30 -L 4300:localhost:4300 -R 0:localhost:3389 `"$env:PINGGY_KEY`@a.pinggy.io";
-          $proc = Start-Process -FilePath "ssh" -ArgumentList $sshArgs -RedirectStandardOutput $logOut -RedirectStandardError $logErr -NoNewWindow -PassThru;
+          Write-Host "Starting localtunnel on port 3389..." -ForegroundColor Cyan;
+          $ltOutput = "C:\localtunnel.log";
+          if (Test-Path $ltOutput) { Remove-Item $ltOutput -Force; }
 
-          Write-Host "Waiting for Pinggy direct TCP address..." -ForegroundColor Yellow;
-          $directUrl = $null;
-          $timeout = [DateTime]::Now.AddSeconds(60);
+          # Start localtunnel process
+          $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "lt --port 3389 --print-requests > $ltOutput 2>&1" -NoNewWindow -PassThru;
+
+          Write-Host "Waiting for localtunnel URL..." -ForegroundColor Yellow;
+          $ltUrl = $null;
+          $timeout = [DateTime]::Now.AddSeconds(30);
+
+          Start-Sleep -Seconds 3; # Give localtunnel time to start
 
           while ([DateTime]::Now -lt $timeout) {
               if ($proc.HasExited) {
-                  Write-Host "SSH process exited with code: $($proc.ExitCode)" -ForegroundColor Red;
-                  Write-Host "--- ERROR OUTPUT ---" -ForegroundColor Red;
-                  if (Test-Path $logErr) { Get-Content $logErr; }
-                  exit 1;
+                  Write-Host "Localtunnel process exited" -ForegroundColor Red;
+                  break;
               }
 
-              # Check via Pinggy web debugger on localhost
-              try {
-                  $resp = Invoke-RestMethod -Uri "http://localhost:4300/urls" -TimeoutSec 1 -ErrorAction SilentlyContinue;
-                  if ($resp -and $resp.tcp) {
-                      $directUrl = $resp.tcp -replace '^tcp://', '';
+              if (Test-Path $ltOutput) {
+                  $content = Get-Content -Path $ltOutput -Raw -ErrorAction SilentlyContinue;
+                  if ($content -match "https://([a-zA-Z0-9-]+\.loca\.lt)") {
+                      $ltUrl = $matches[1];
                       break;
                   }
-              } catch {}
-
-              # Fallback: check output files for TCP address
-              $outText = if (Test-Path $logOut) { Get-Content -Path $logOut -Raw -ErrorAction SilentlyContinue } else { "" };
-              $errText = if (Test-Path $logErr) { Get-Content -Path $logErr -Raw -ErrorAction SilentlyContinue } else { "" };
-              $cleanText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', '';
-
-              if ($cleanText -match "tcp://([a-zA-Z0-9\.\-]+:\d+)") {
-                  $directUrl = $matches[1];
-                  break;
-              } elseif ($cleanText -match "([a-zA-Z0-9\.\-]+\.pinggy\.[a-z]+:\d+)") {
-                  $directUrl = $matches[1];
-                  break;
-              } elseif ($cleanText -match "([a-zA-Z0-9\.\-]+\.pinggy\.link:\d+)") {
-                  $directUrl = $matches[1];
-                  break;
               }
-
               Start-Sleep -Seconds 1;
           }
 
-          if ($directUrl) {
+          if ($ltUrl) {
               Write-Host "";
               Write-Host "==================================================" -ForegroundColor Green;
-              Write-Host ">>> PINGGY RDP READY <<<" -ForegroundColor Cyan;
-              Write-Host "Address  : $directUrl" -ForegroundColor Yellow;
-              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow;
-              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow;
+              Write-Host "✓ LOCALTUNNEL ACTIVE (Open Source)" -ForegroundColor Cyan;
               Write-Host "==================================================" -ForegroundColor Green;
-              Write-Host "Connect directly via mstsc to: $directUrl" -ForegroundColor White;
+              Write-Host "Tunnel URL      : $ltUrl" -ForegroundColor Yellow;
+              Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow;
+              Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow;
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host "Connection Method:" -ForegroundColor Magenta;
+              Write-Host "  ⚠️  Localtunnel provides HTTPS, not direct TCP" -ForegroundColor Yellow;
+              Write-Host "  You need to use a VPN or proxy to access RDP" -ForegroundColor Yellow;
+              Write-Host "  Alternative: Use Pinggy Free or Cloudflare" -ForegroundColor Yellow;
+              Write-Host "==================================================" -ForegroundColor Green;
           } else {
-              Write-Host "[!] Could not fetch Pinggy URL." -ForegroundColor Red;
-              if (Test-Path $logOut) { Write-Host "--- STDOUT ---"; Get-Content $logOut; }
-              if (Test-Path $logErr) { Write-Host "--- STDERR ---"; Get-Content $logErr; }
+              Write-Host "[✗] Failed to start localtunnel" -ForegroundColor Red;
+              if (Test-Path $ltOutput) { Get-Content $ltOutput; }
+              Write-Host "Localtunnel might not support direct RDP tunneling" -ForegroundColor Yellow;
+              Write-Host "Recommend using: pinggy-free or cloudflare option" -ForegroundColor Yellow;
               exit 1;
           }
 
       # ======================================================================
-      # Option 3: Ngrok (Requires NGROK_AUTHTOKEN secret)
-      # Free tier available, direct TCP support
+      # Option 4: Playit Free (NO AUTH)
       # ======================================================================
-      - name: 4. Launch Ngrok Tunnel (With Auth Token)
-        if: ${{ github.event.inputs.tunnel_provider == 'ngrok' }}
+      - name: 2d. Launch Playit Free Tunnel
+        if: ${{ github.event.inputs.tunnel_provider == 'playit-free' }}
         shell: powershell
         run: |
-          # Verify Ngrok auth token is configured
-          if (-not $env:NGROK_AUTHTOKEN) {
-              Write-Host "[!] NGROK_AUTHTOKEN secret is not configured!" -ForegroundColor Red;
-              Write-Host "Add NGROK_AUTHTOKEN to GitHub repository secrets:" -ForegroundColor Yellow;
-              Write-Host "  1. Go to Settings > Secrets and variables > Actions" -ForegroundColor White;
-              Write-Host "  2. Click 'New repository secret'" -ForegroundColor White;
-              Write-Host "  3. Name: NGROK_AUTHTOKEN" -ForegroundColor White;
-              Write-Host "  4. Value: Your token from https://dashboard.ngrok.com" -ForegroundColor White;
+          Write-Host "=====================================================" -ForegroundColor Green;
+          Write-Host "Starting Playit Free Tunnel" -ForegroundColor Cyan;
+          Write-Host "=====================================================" -ForegroundColor Green;
+          Write-Host "Endpoint: Playit (No API key, anonymous tunnel)" -ForegroundColor Yellow;
+          Write-Host "Method: Playit agent with auto-claim" -ForegroundColor Yellow;
+          Write-Host "";
+
+          Write-Host "Downloading Playit agent..." -ForegroundColor Cyan;
+          try {
+              Invoke-WebRequest -Uri "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-windows-x86_64.exe" -OutFile "C:\playit.exe" -ErrorAction Stop;
+              Write-Host "Playit agent downloaded successfully" -ForegroundColor Green;
+          } catch {
+              Write-Host "Failed to download Playit: $_" -ForegroundColor Red;
               exit 1;
           }
 
-          Write-Host "Downloading ngrok..." -ForegroundColor Cyan;
-          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "C:\ngrok.zip";
-          Expand-Archive -Path "C:\ngrok.zip" -DestinationPath "C:\" -Force;
+          $playitOut = "C:\playit_out.log";
+          $playitErr = "C:\playit_err.log";
+          if (Test-Path $playitOut) { Remove-Item $playitOut -Force; }
+          if (Test-Path $playitErr) { Remove-Item $playitErr -Force; }
 
-          Write-Host "Configuring ngrok auth token..." -ForegroundColor Cyan;
-          & "C:\ngrok.exe" config add-authtoken $env:NGROK_AUTHTOKEN;
+          Write-Host "Starting Playit agent (free tier, no account needed)..." -ForegroundColor Cyan;
+          # Playit free tier uses agent directly without arguments
+          $proc = Start-Process -FilePath "C:\playit.exe" -RedirectStandardOutput $playitOut -RedirectStandardError $playitErr -NoNewWindow -PassThru;
 
-          $logFile = "C:\ngrok.log";
-          if (Test-Path $logFile) { Remove-Item $logFile -Force; }
-
-          Write-Host "Starting ngrok tunnel..." -ForegroundColor Cyan;
-          $proc = Start-Process -FilePath "C:\ngrok.exe" -ArgumentList "tcp", "3389", "--log", $logFile --log-level debug" -NoNewWindow -PassThru;
-
-          Write-Host "Waiting for ngrok public address..." -ForegroundColor Yellow;
-          $publicAddr = $null;
-          $timeout = [DateTime]::Now.AddSeconds(60);
+          Write-Host "Waiting for Playit claim URL..." -ForegroundColor Yellow;
+          $claimUrl = $null;
+          $timeout = [DateTime]::Now.AddSeconds(90);
+          $attempts = 0;
 
           while ([DateTime]::Now -lt $timeout) {
+              $attempts++;
               if ($proc.HasExited) {
-                  Write-Host "Ngrok process terminated unexpectedly." -ForegroundColor Red;
-                  if (Test-Path $logFile) {
-                      Write-Host "--- LOG ---";
-                      Get-Content $logFile;
-                  }
-                  exit 1;
-              }
-
-              # Query ngrok API for tunnel status
-              try {
-                  $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 1 -ErrorAction SilentlyContinue;
-                  if ($resp.tunnels -and $resp.tunnels.Count -gt 0) {
-                      $tunnel = $resp.tunnels[0];
-                      if ($tunnel.public_url -match "tcp://(.+)") {
-                          $publicAddr = $matches[1];
-                          break;
+                  Write-Host "Playit process exited with code: $($proc.ExitCode)" -ForegroundColor Red;
+                  Write-Host "" -ForegroundColor Red;
+                  if (Test-Path $playitErr) {
+                      $errContent = Get-Content $playitErr -Raw;
+                      if ($errContent -match "unexpected argument") {
+                          Write-Host "Note: This Playit version may require account setup" -ForegroundColor Yellow;
                       }
+                      Write-Host "=== PLAYIT ERROR ===" -ForegroundColor Red;
+                      Write-Host $errContent -ForegroundColor Red;
+                      Write-Host "====================" -ForegroundColor Red;
                   }
-              } catch {}
+                  exit 1;
+              }
 
+              $outText = if (Test-Path $playitOut) { Get-Content -Path $playitOut -Raw -ErrorAction SilentlyContinue } else { "" };
+              $errText = if (Test-Path $playitErr) { Get-Content -Path $playitErr -Raw -ErrorAction SilentlyContinue } else { "" };
+              $fullText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', '';
+
+              if ($fullText -match "(https://playit\.gg/claim/[a-zA-Z0-9_\-]+)") {
+                  $claimUrl = $matches[1];
+                  Write-Host "Playit claim URL received!" -ForegroundColor Green;
+                  break;
+              }
+
+              if ($attempts % 10 -eq 0) {
+                  Write-Host "[Waiting...] Attempt $attempts/90 seconds" -ForegroundColor Gray;
+              }
               Start-Sleep -Seconds 1;
           }
 
-          if ($publicAddr) {
+          if ($claimUrl) {
               Write-Host "";
               Write-Host "==================================================" -ForegroundColor Green;
-              Write-Host ">>> NGROK RDP READY <<<" -ForegroundColor Cyan;
-              Write-Host "Address  : $publicAddr" -ForegroundColor Yellow;
-              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow;
-              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow;
+              Write-Host "✓ PLAYIT FREE TUNNEL CLAIM URL" -ForegroundColor Cyan;
               Write-Host "==================================================" -ForegroundColor Green;
-              Write-Host "Connect directly via mstsc to: $publicAddr" -ForegroundColor White;
+              Write-Host "Claim Link      : $claimUrl" -ForegroundColor Yellow;
+              Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow;
+              Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow;
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host "Setup Instructions:" -ForegroundColor Magenta;
+              Write-Host "  1. Open this link in browser:" -ForegroundColor White;
+              Write-Host "     $claimUrl" -ForegroundColor Cyan;
+              Write-Host "  2. Click 'Claim Tunnel'" -ForegroundColor White;
+              Write-Host "  3. Set port 3389 (RDP)" -ForegroundColor White;
+              Write-Host "  4. You'll get a direct address (e.g., 1.tcp.playit.gg:12345)" -ForegroundColor White;
+              Write-Host "  5. Connect RDP to that address" -ForegroundColor White;
+              Write-Host "==================================================" -ForegroundColor Green;
           } else {
-              Write-Host "[!] Could not fetch ngrok URL." -ForegroundColor Red;
-              if (Test-Path $logFile) { Get-Content $logFile; }
+              Write-Host "[✗] Could not get Playit claim URL" -ForegroundColor Red;
+              if (Test-Path $playitOut) { 
+                  Write-Host "=== PLAYIT STDOUT ===" -ForegroundColor Red;
+                  Get-Content $playitOut;
+              }
+              if (Test-Path $playitErr) { 
+                  Write-Host "=== PLAYIT STDERR ===" -ForegroundColor Red;
+                  Get-Content $playitErr;
+              }
               exit 1;
           }
 
       # ======================================================================
-      # Step 5: Keep session alive until workflow timeout
+      # Step 3: Keep session alive until workflow timeout
       # ======================================================================
-      - name: 5. Keep Alive
+      - name: 3. Keep Tunnel Alive
         shell: powershell
         run: |
+          Write-Host "";
+          Write-Host "Tunnel is active! Session will remain open..." -ForegroundColor Green;
+          Write-Host "";
+
           for ($i = 1; $i -le 350; $i++) {
               Start-Sleep -Seconds 60;
-              Write-Host "[$i/350 min] Runner session active...";
+              $elapsed = $i;
+              Write-Host "[$elapsed/350 min] Tunnel still active - RDP session available" -ForegroundColor Green;
           }
+
+          Write-Host "Workflow timeout reached. Tunnel session ending." -ForegroundColor Yellow;
