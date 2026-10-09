@@ -12,82 +12,68 @@ jobs:
       - name: Configure RDP, User & Cloudflare Tunnel
         shell: powershell
         run: |
-          # 1. فعال‌سازی RDP و پورت فایروال
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Restart-Service TermService -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0;
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0;
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop";
+          Restart-Service TermService -Force;
 
-          # 2. ایجاد کاربر ادمین برای ورود
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
+          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force;
           if (-not (Get-LocalUser -Name "CynetAdmin" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires
+              New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires;
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue;
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue;
 
-          # 3. دانلود باینری رسمی cloudflared
-          $cfPath = "C:\cloudflared.exe"
-          $logErr = "C:\cf_err.log"
-          $logOut = "C:\cf_out.log"
-          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfPath
+          $cfPath = "C:\cloudflared.exe";
+          $logErr = "C:\cf_err.log";
+          $logOut = "C:\cf_out.log";
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cfPath;
 
-          # 4. اجرای پروسه کلودفلر در پس‌زمینه
-          $cfProcess = Start-Process -FilePath$cfPath `
-            -ArgumentList "tunnel --url tcp://localhost:3389 --no-autoupdate" `
-            -RedirectStandardError $logErr `
-            -RedirectStandardOutput $logOut `
-            -PassThru
+          $cfProcess = Start-Process -FilePath $cfPath -ArgumentList "tunnel --url tcp://localhost:3389 --no-autoupdate" -RedirectStandardError $logErr -RedirectStandardOutput $logOut -PassThru;
 
-          Write-Host "Waiting for TryCloudflare Tunnel initialization..."
-          $domain = $null$timeout = [DateTime]::Now.AddSeconds(60)
+          Write-Host "Waiting for TryCloudflare Tunnel initialization...";
+          $domain = $null;
+          $timeout = [DateTime]::Now.AddSeconds(60);
 
-          # بررسی لاگ تا زمان دریافت دامنه اختصاصی
           while ([DateTime]::Now -lt $timeout) {
               if (Test-Path $logErr) {
-                  $rawLog = [System.IO.File]::ReadAllText($logErr)
-                  $match = [System.Text.RegularExpressions.Regex]::Match($rawLog, "https://([a-zA-Z0-9-]+\.trycloudflare\.com)")
+                  $rawLog = [System.IO.File]::ReadAllText($logErr);
+                  $match = [System.Text.RegularExpressions.Regex]::Match($rawLog, "https://([a-zA-Z0-9-]+\.trycloudflare\.com)");
                   if ($match.Success) {
-                      $domain =$match.Groups[1].Value
-                      break
+                      $domain = $match.Groups[1].Value;
+                      break;
                   }
               }
-              Start-Sleep -Milliseconds 500
+              Start-Sleep -Milliseconds 500;
           }
 
-          # 5. چاپ اطلاعات ورود در صورت موفقیت
           if ($domain) {
-              Write-Host ""
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ">>> CLOUDFLARE RDP READY! <<<" -ForegroundColor Cyan
-              Write-Host "Domain   : $domain" -ForegroundColor Yellow
-              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
-              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host ""
-              Write-Host "Step 1: Run this command in CMD / PowerShell on your PC:" -ForegroundColor Magenta
-              Write-Host "cloudflared access rdp --hostname $domain --url localhost:13389" -ForegroundColor White
-              Write-Host ""
-              Write-Host "Step 2: Open Remote Desktop Connection (mstsc) and connect to:" -ForegroundColor Magenta
-              Write-Host "localhost:13389" -ForegroundColor White
-              Write-Host ""
+              Write-Host "";
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host ">>> CLOUDFLARE RDP READY! <<<" -ForegroundColor Cyan;
+              Write-Host "Domain   : $domain" -ForegroundColor Yellow;
+              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow;
+              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow;
+              Write-Host "==================================================" -ForegroundColor Green;
+              Write-Host "";
+              Write-Host "Step 1: Run this command in CMD / PowerShell on your PC:" -ForegroundColor Magenta;
+              Write-Host "cloudflared access rdp --hostname $domain --url localhost:13389" -ForegroundColor White;
+              Write-Host "";
+              Write-Host "Step 2: Open Remote Desktop Connection (mstsc) and connect to:" -ForegroundColor Magenta;
+              Write-Host "localhost:13389" -ForegroundColor White;
+              Write-Host "";
           } else {
-              Write-Host "[!] Failed to retrieve Cloudflare tunnel domain." -ForegroundColor Red
-              if (Test-Path $logErr) { 
-                  Get-Content $logErr 
-              }
-              exit 1
+              Write-Host "[!] Failed to retrieve Cloudflare tunnel domain." -ForegroundColor Red;
+              if (Test-Path $logErr) { Get-Content $logErr };
+              exit 1;
           }
 
-          # 6. زنده نگه داشتن سرور به مدت 6 ساعت
           for ($i = 1; $i -le 350; $i++) {
               if ($cfProcess.HasExited) {
-                  Write-Host "[!] Cloudflared terminated unexpectedly." -ForegroundColor Red
-                  if (Test-Path $logErr) { 
-                      Get-Content $logErr 
-                  }
-                  exit 1
+                  Write-Host "[!] Cloudflared terminated unexpectedly." -ForegroundColor Red;
+                  if (Test-Path $logErr) { Get-Content $logErr };
+                  exit 1;
               }
-              Start-Sleep -Seconds 60
-              Write-Host "[$i/350 min] Runner & Tunnel Active..."
+              Start-Sleep -Seconds 60;
+              Write-Host "[$i/350 min] Runner & Tunnel Active...";
           }
