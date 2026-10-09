@@ -38,7 +38,7 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
 
       # ----------------------------------------------------------------------
-      # Option 1: Playit.gg
+      # Option 1: Playit.gg  (FIXED: no "run" argument)
       # ----------------------------------------------------------------------
       - name: 2. Launch Playit Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'playit' }}
@@ -50,7 +50,8 @@ jobs:
           if (Test-Path $playitOut) { Remove-Item $playitOut -Force }
           if (Test-Path $playitErr) { Remove-Item $playitErr -Force }
 
-          $proc = Start-Process -FilePath "C:\playit.exe" -ArgumentList "run" -RedirectStandardOutput $playitOut -RedirectStandardError $playitErr -NoNewWindow -PassThru
+          # CORRECTED: removed the invalid "run" argument
+          $proc = Start-Process -FilePath "C:\playit.exe" -RedirectStandardOutput $playitOut -RedirectStandardError $playitErr -NoNewWindow -PassThru
 
           Write-Host "Waiting for Playit setup URL..."
           $claimUrl = $null
@@ -164,7 +165,7 @@ jobs:
           if (Test-Path $cfOut) { Remove-Item $cfOut -Force }
           if (Test-Path $cfErr) { Remove-Item $cfErr -Force }
 
-          # CORRECTED: Added --no-autoupdate and --protocol http2
+          # CORRECTED: added --no-autoupdate and --protocol http2
           $cfArgs = "tunnel --url tcp://localhost:3389 --no-autoupdate --protocol http2"
           $proc = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $cfArgs -RedirectStandardOutput $cfOut -RedirectStandardError $cfErr -NoNewWindow -PassThru
 
@@ -182,7 +183,6 @@ jobs:
               $errText = if (Test-Path $cfErr) { Get-Content -Path $cfErr -Raw -ErrorAction SilentlyContinue } else { "" }
               $combined = "$outText`n$errText"
 
-              # Extract the trycloudflare.com domain
               if ($combined -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
                   $domain = $matches[1]
                   break
