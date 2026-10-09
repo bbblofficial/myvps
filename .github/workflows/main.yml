@@ -37,11 +37,21 @@ jobs:
 
           while ([DateTime]::Now -lt $timeout) {
               if (Test-Path $logErr) {
-                  $rawLog = [System.IO.File]::ReadAllText($logErr);
-                  $match = [System.Text.RegularExpressions.Regex]::Match($rawLog, "https://([a-zA-Z0-9-]+\.trycloudflare\.com)");
-                  if ($match.Success) {
-                      $domain = $match.Groups[1].Value;
-                      break;
+                  try {
+                      # باز کردن فایل با دسترسی اشتراکی ReadWrite جهت جلوگیری از ارور قفل فایل
+                      $fileStream = [System.IO.File]::Open($logErr, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite);
+                      $streamReader = New-Object System.IO.StreamReader($fileStream);
+                      $rawLog = $streamReader.ReadToEnd();
+                      $streamReader.Dispose();
+                      $fileStream.Dispose();
+
+                      $match = [System.Text.RegularExpressions.Regex]::Match($rawLog, "https://([a-zA-Z0-9-]+\.trycloudflare\.com)");
+                      if ($match.Success) {
+                          $domain = $match.Groups[1].Value;
+                          break;
+                      }
+                  } catch {
+                      # نادیده گرفتن تداخل‌های میلی‌ثانیه‌ای در حین ثبت لاگ
                   }
               }
               Start-Sleep -Milliseconds 500;
@@ -64,14 +74,14 @@ jobs:
               Write-Host "";
           } else {
               Write-Host "[!] Failed to retrieve Cloudflare tunnel domain." -ForegroundColor Red;
-              if (Test-Path $logErr) { Get-Content $logErr };
+              if (Test-Path $logErr) { Get-Content $logErr -ErrorAction SilentlyContinue };
               exit 1;
           }
 
           for ($i = 1; $i -le 350; $i++) {
               if ($cfProcess.HasExited) {
                   Write-Host "[!] Cloudflared terminated unexpectedly." -ForegroundColor Red;
-                  if (Test-Path $logErr) { Get-Content $logErr };
+                  if (Test-Path $logErr) { Get-Content $logErr -ErrorAction SilentlyContinue };
                   exit 1;
               }
               Start-Sleep -Seconds 60;
