@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: 1. Configure RDP and Admin Account
+      - name: 1. Setup RDP and User
         shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
@@ -27,24 +27,51 @@ jobs:
       - name: 2. Launch Tunnel & Keep Alive
         shell: powershell
         run: |
+          # دانلود cloudflared
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
-          # اجرای cloudflared در قالب یک Job محلی تا توسط گیت‌هاب بسته نشود
-          $job = Start-Job -ScriptBlock {
-              & "C:\cloudflared.exe" tunnel --url rdp://localhost:3389 --no-autoupdate 2>&1
-          }
+          $logFile = "C:\cf_output.log"
+          
+          # اجرای پروسه با هدایت هر دو استریم به یک فایل
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "C:\cloudflared.exe"
+          $psi.Arguments = "tunnel --url tcp://localhost:3389 --no-autoupdate"
+          $psi.RedirectStandardError = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.UseShellExecute = $false
+          $psi.CreateNoWindow = $true
 
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $psi
+
+          # ثبت بلادرنگ خروجی‌ها در فایل
+          $action = {
+              if ($Event.SourceEventArgs.Data) {
+                  Add-Content -Path $logFile -Value $Event.SourceEventArgs.Data
+              }
+          }
+          Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
+          Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
+
+          $process.Start() | Out-Null
+          $process.BeginOutputReadLine()
+          $process.BeginErrorReadLine()
+
+          Write-Host "Waiting for TryCloudflare Tunnel URL..."
           $domain = $null
           $timeout = [DateTime]::Now.AddSeconds(60)
 
-          # دریافت خروجی زنده تا زمان پیدا شدن دامنه
+          # بررسی مداوم تا زمان استخراج دامنه
           while ([DateTime]::Now -lt $timeout) {
-              $output = Receive-Job -Job $job -Keep
-              if ($output -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
-                  $domain = $Matches[1]
-                  break
+              if (Test-Path $logFile) {
+                  $text = [System.IO.File]::ReadAllText($logFile)
+                  $match = [System.Text.RegularExpressions.Regex]::Match($text, "https://([a-zA-Z0-9-]+\.trycloudflare\.com)")
+                  if ($match.Success) {
+                      $domain = $match.Groups[1].Value
+                      break
+                  }
               }
-              Start-Sleep -Milliseconds 500
+              Start-Sleep -Milliseconds 400
           }
 
           if ($domain) {
@@ -56,18 +83,18 @@ jobs:
               Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
               Write-Host "==================================================" -ForegroundColor Green
               Write-Host ""
-              Write-Host "Command for your PC:" -ForegroundColor Magenta
+              Write-Host "Run this command on your personal PC:" -ForegroundColor Magenta
               Write-Host "cloudflared access rdp --hostname $domain --url rdp://localhost:13389" -ForegroundColor White
+              Write-Host "Then connect mstsc to: localhost:13389" -ForegroundColor Magenta
               Write-Host ""
           } else {
-              Write-Host "[!] Could not detect trycloudflare domain." -ForegroundColor Red
-              Receive-Job -Job $job
-              Stop-Job -Job $job
+              Write-Host "[!] Failed to get tunnel URL." -ForegroundColor Red
+              if (Test-Path $logFile) { Get-Content $logFile }
               exit 1
           }
 
-          # نگه داشتن استپ تا پایان زمان مجاز بدون قطع شدن تونل
+          # نگه داشتن نشست بدون قطع شدن پروسه
           for ($i = 1; $i -le 350; $i++) {
               Start-Sleep -Seconds 60
-              Write-Host "[$i/350 min] Runner alive..."
+              Write-Host "[$i/350 min] Runner and tunnel active..."
           }
