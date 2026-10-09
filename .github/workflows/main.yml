@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - 'pinggy-free'
+          - 'cloudflare'
           - 'playit-free'
           - 'bore-pub'
           - 'serveo'
@@ -139,9 +140,89 @@ jobs:
           Write-Host "==================================================" -ForegroundColor Green
 
       # ======================================================================
-      # Option 2: Playit Free (anonymous TCP tunnel, works for RDP)
+      # Option 2: Cloudflare TryCloudflare (with fixes, but known limitations)
       # ======================================================================
-      - name: 2b. Launch Playit Free Tunnel
+      - name: 2b. Launch Cloudflare TryCloudflare Tunnel
+        if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
+        shell: powershell
+        run: |
+          $OutputEncoding = [System.Text.Encoding]::UTF8
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          Write-Host "=====================================================" -ForegroundColor Green
+          Write-Host "Starting Cloudflare TryCloudflare Tunnel" -ForegroundColor Cyan
+          Write-Host "=====================================================" -ForegroundColor Green
+          Write-Host "[!] WARNING: TryCloudflare Quick Tunnels have known" -ForegroundColor Yellow
+          Write-Host "    limitations with RDP and may fail with a" -ForegroundColor Yellow
+          Write-Host "    'websocket: bad handshake' error." -ForegroundColor Yellow
+          Write-Host "    Consider using pinggy-free or bore-pub instead." -ForegroundColor Yellow
+          Write-Host ""
+
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe" -ErrorAction Stop
+
+          $logFile = "C:\cloudflared.log"
+          if (Test-Path $logFile) { Remove-Item $logFile -Force }
+
+          Write-Host "Starting cloudflared tunnel with rdp:// protocol..." -ForegroundColor Cyan
+          # Use rdp:// for RDP, but be aware of the handshake limitation
+          $cfArgs = "tunnel --url rdp://127.0.0.1:3389 --protocol http2 --logfile $logFile --no-autoupdate"
+          $proc = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $cfArgs -NoNewWindow -PassThru
+
+          Write-Host "Waiting for Cloudflare tunnel URL..." -ForegroundColor Yellow
+          $cfDomain = $null
+          $timeout = [DateTime]::Now.AddSeconds(60)
+          $attempts = 0
+
+          while ([DateTime]::Now -lt $timeout) {
+              $attempts++
+              if ($proc.HasExited) {
+                  Write-Host "Cloudflared exited with code: $($proc.ExitCode)" -ForegroundColor Red
+                  if (Test-Path $logFile) { Get-Content $logFile }
+                  exit 1
+              }
+              if (Test-Path $logFile) {
+                  $content = Get-Content -Path $logFile -Raw -ErrorAction SilentlyContinue
+                  if ($content -match "https://([a-zA-Z0-9-]+\.trycloudflare\.com)") {
+                      $cfDomain = $matches[1]; break
+                  }
+              }
+              if ($attempts % 10 -eq 0) { Write-Host "[Waiting...] $attempts seconds elapsed" -ForegroundColor Gray }
+              Start-Sleep -Seconds 1
+          }
+
+          if (-not $cfDomain) {
+              Write-Host "[X] Failed to get Cloudflare tunnel URL" -ForegroundColor Red
+              if (Test-Path $logFile) { Get-Content $logFile }
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "[OK] CLOUDFLARE TUNNEL ACTIVE" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "Tunnel Domain   : $cfDomain" -ForegroundColor Yellow
+          Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "IMPORTANT: Download cloudflared on YOUR PC FIRST:" -ForegroundColor Red
+          Write-Host "  https://github.com/cloudflare/cloudflared/releases/latest" -ForegroundColor White
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "On YOUR PC, run (try tcp instead of rdp first):" -ForegroundColor Magenta
+          Write-Host "  cloudflared access tcp --hostname $cfDomain --url localhost:13389" -ForegroundColor Cyan
+          Write-Host "  (If that fails, try: cloudflared access rdp --hostname $cfDomain --url rdp://localhost:13389)" -ForegroundColor Cyan
+          Write-Host "Then connect RDP to: localhost:13389" -ForegroundColor White
+          Write-Host "Username: CynetAdmin  Password: Cynet@2026" -ForegroundColor White
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "[!] If 'websocket: bad handshake' persists:" -ForegroundColor Yellow
+          Write-Host "    1. Update cloudflared: cloudflared update" -ForegroundColor White
+          Write-Host "    2. Ensure hostname is ALL LOWERCASE" -ForegroundColor White
+          Write-Host "    3. Check WebSockets is enabled in Cloudflare dashboard" -ForegroundColor White
+          Write-Host "    4. Disable Super Bot Fight Mode for this subdomain" -ForegroundColor White
+          Write-Host "    5. If all else fails, use pinggy-free or bore-pub instead" -ForegroundColor White
+
+      # ======================================================================
+      # Option 3: Playit Free (anonymous TCP tunnel, works for RDP)
+      # ======================================================================
+      - name: 2c. Launch Playit Free Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'playit-free' }}
         shell: powershell
         run: |
@@ -204,9 +285,9 @@ jobs:
           Write-Host "==================================================" -ForegroundColor Green
 
       # ======================================================================
-      # Option 3: bore.pub (simple TCP tunnel, no auth)
+      # Option 4: bore.pub (simple TCP tunnel, no auth)
       # ======================================================================
-      - name: 2c. Launch bore.pub Tunnel
+      - name: 2d. Launch bore.pub Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'bore-pub' }}
         shell: powershell
         run: |
@@ -267,9 +348,9 @@ jobs:
           Write-Host "Connect Remote Desktop to: $tunnelAddr" -ForegroundColor White
 
       # ======================================================================
-      # Option 4: Serveo (SSH reverse tunnel, no auth, TCP)
+      # Option 5: Serveo (SSH reverse tunnel, no auth, TCP)
       # ======================================================================
-      - name: 2d. Launch Serveo Tunnel
+      - name: 2e. Launch Serveo Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'serveo' }}
         shell: powershell
         run: |
