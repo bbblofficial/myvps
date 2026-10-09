@@ -19,9 +19,9 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ----------------------------------------------------------------------
-      # ۱. تنظیم RDP و اطمینان از باز شدن پورت ۳۳۸۹
-      # ----------------------------------------------------------------------
+      # ======================================================================
+      # Step 1: Setup RDP and ensure port 3389 is open
+      # ======================================================================
       - name: 1. Setup RDP and User
         shell: powershell
         run: |
@@ -38,10 +38,11 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue;
 
           Write-Host "Verifying RDP Port 3389...";
-          $portReady =$false;
-          for ($i = 0; $i -lt 15; $i++) {$check = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue;
+          $portReady = $false;
+          for ($i = 0; $i -lt 15; $i++) {
+              $check = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue;
               if ($check.TcpTestSucceeded) {
-                  $portReady =$true;
+                  $portReady = $true;
                   Write-Host "Port 3389 is OPEN and READY!" -ForegroundColor Green;
                   break;
               }
@@ -52,24 +53,24 @@ jobs:
               exit 1;
           }
 
-      # ----------------------------------------------------------------------
-      # گزینه ۱: Pinggy (مستقیم با MSTSC، بدون نیاز به نصب هیچ ابزاری روی کامپیوتر)
-      # ----------------------------------------------------------------------
+      # ======================================================================
+      # Option 1: Pinggy (Direct with MSTSC, no client installation needed)
+      # ======================================================================
       - name: 2. Launch Pinggy Tunnel (Direct MSTSC)
         if: ${{ github.event.inputs.tunnel_provider == 'pinggy' }}
         shell: powershell
         run: |
           $logOut = "C:\pinggy_out.log";
           $logErr = "C:\pinggy_err.log";
-          if (Test-Path $logOut) { Remove-Item$logOut -Force; }
-          if (Test-Path $logErr) { Remove-Item$logErr -Force; }
+          if (Test-Path $logOut) { Remove-Item $logOut -Force; }
+          if (Test-Path $logErr) { Remove-Item $logErr -Force; }
 
-          # فورس کردن خروجی متنی با b+tcp و باز کردن وب‌دیباگر محلی
+          # Force TCP output and enable local web debugger
           $sshArgs = "-p 443 -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ServerAliveInterval=30 -L 4300:localhost:4300 -R 0:localhost:3389 b+tcp@a.pinggy.io";
-          $proc = Start-Process -FilePath "ssh" -ArgumentList $sshArgs -RedirectStandardOutput $logOut -RedirectStandardError$logErr -NoNewWindow -PassThru;
+          $proc = Start-Process -FilePath "ssh" -ArgumentList $sshArgs -RedirectStandardOutput $logOut -RedirectStandardError $logErr -NoNewWindow -PassThru;
 
           Write-Host "Waiting for Pinggy direct TCP address...";
-          $directUrl =$null;
+          $directUrl = $null;
           $timeout = [DateTime]::Now.AddSeconds(60);
 
           while ([DateTime]::Now -lt $timeout) {
@@ -78,18 +79,18 @@ jobs:
                   break;
               }
 
-              # بررسی از طریق وب‌دیباگر داخلی Pinggy روی لوکال‌هاست
+              # Check via Pinggy web debugger on localhost
               try {
                   $resp = Invoke-RestMethod -Uri "http://localhost:4300/urls" -TimeoutSec 1 -ErrorAction SilentlyContinue;
-                  if ($resp -and$resp.tcp) {
-                      $directUrl =$resp.tcp -replace '^tcp://', '';
+                  if ($resp -and $resp.tcp) {
+                      $directUrl = $resp.tcp -replace '^tcp://', '';
                       break;
                   }
               } catch {}
 
-              # بررسی پشتیبان از طریق تحلیل فایل‌های خروجی
-              $outText = if (Test-Path $logOut) { Get-Content -Path$logOut -Raw -ErrorAction SilentlyContinue } else { "" };
-              $errText = if (Test-Path $logErr) { Get-Content -Path$logErr -Raw -ErrorAction SilentlyContinue } else { "" };
+              # Fallback: check output files for TCP address
+              $outText = if (Test-Path $logOut) { Get-Content -Path $logOut -Raw -ErrorAction SilentlyContinue } else { "" };
+              $errText = if (Test-Path $logErr) { Get-Content -Path $logErr -Raw -ErrorAction SilentlyContinue } else { "" };
               $cleanText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', '';
 
               if ($cleanText -match "tcp://([a-zA-Z0-9\.\-]+:\d+)") {
@@ -122,9 +123,9 @@ jobs:
               exit 1;
           }
 
-      # ----------------------------------------------------------------------
-      # گزینه ۲: Cloudflare Tunnel (بدون باگ ۱۰۳۳ با اجبار به http2)
-      # ----------------------------------------------------------------------
+      # ======================================================================
+      # Option 2: Cloudflare Tunnel (HTTP/2 protocol to avoid UDP restrictions)
+      # ======================================================================
       - name: 3. Launch Cloudflare Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
         shell: powershell
@@ -133,7 +134,7 @@ jobs:
           $logFile = "C:\cloudflared.log";
           if (Test-Path $logFile) { Remove-Item $logFile -Force; }
 
-          # پروتکل http2 از مسدود شدن پروتکل UDP/QUIC در گیت‌هاب جلوگیری می‌کند
+          # HTTP/2 protocol avoids UDP/QUIC blockage on GitHub Actions
           $cfArgs = "tunnel --url tcp://localhost:3389 --protocol http2 --logfile $logFile --no-autoupdate";
           $proc = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $cfArgs -NoNewWindow -PassThru;
 
@@ -176,9 +177,9 @@ jobs:
               exit 1;
           }
 
-      # ----------------------------------------------------------------------
-      # گزینه ۳: Playit.gg (لینک Claim سالم بدون مشکل بافرینگ لاگ)
-      # ----------------------------------------------------------------------
+      # ======================================================================
+      # Option 3: Playit.gg (Fixed - removed unsupported 'run' argument)
+      # ======================================================================
       - name: 4. Launch Playit Tunnel (Direct MSTSC)
         if: ${{ github.event.inputs.tunnel_provider == 'playit' }}
         shell: powershell
@@ -189,7 +190,8 @@ jobs:
           if (Test-Path $playitOut) { Remove-Item $playitOut -Force; }
           if (Test-Path $playitErr) { Remove-Item $playitErr -Force; }
 
-          $proc = Start-Process -FilePath "C:\playit.exe" -ArgumentList "run" -RedirectStandardOutput $playitOut -RedirectStandardError $playitErr -NoNewWindow -PassThru;
+          # Fixed: removed 'run' argument which is not supported by playit.exe
+          $proc = Start-Process -FilePath "C:\playit.exe" -RedirectStandardOutput $playitOut -RedirectStandardError $playitErr -NoNewWindow -PassThru;
 
           Write-Host "Waiting for Playit setup URL...";
           $claimUrl = $null;
@@ -205,7 +207,7 @@ jobs:
               $cleanText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', '';
 
               if ($cleanText -match "(https://playit\.gg/claim/[a-zA-Z0-9_\-]+)") {
-                  $claimUrl =$matches[1];
+                  $claimUrl = $matches[1];
                   break;
               }
               Start-Sleep -Seconds 1;
@@ -227,9 +229,9 @@ jobs:
               exit 1;
           }
 
-      # ----------------------------------------------------------------------
-      # ۵. زنده نگه داشتن نشست تا پایان زمان مجاز
-      # ----------------------------------------------------------------------
+      # ======================================================================
+      # Step 5: Keep session alive until workflow timeout
+      # ======================================================================
       - name: 5. Keep Alive
         shell: powershell
         run: |
