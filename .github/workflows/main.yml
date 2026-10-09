@@ -14,40 +14,97 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          # Ensure RDP service is running
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
       - name: 2. Create Admin Account
         run: |
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
-      - name: 3. Install & Connect Tailscale VPN
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: 3. Install & Start Bore Tunnel for RDP (Port 3389)
         run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
+          # --- Download bore ---
+          $url = "https://github.com/ekzhang/bore/releases/latest/download/bore-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile "C:\bore.zip"
+          Expand-Archive -Path "C:\bore.zip" -DestinationPath "C:\bore" -Force
+          Write-Host "Bore downloaded and extracted."
+
+          # --- Start bore in background, capture output to a log file ---
+          $logFile = "C:\bore_output.log"
+          if (Test-Path $logFile) { Remove-Item $logFile -Force }
+
+          # Use --port 0 to let server assign random port, OR specify a port like 45678
+          # Change REQUESTED_PORT to a number if you want a specific public port
+          $REQUESTED_PORT = 0
+
+          $boreArgs = "local 3389 --to bore.pub"
+          if ($REQUESTED_PORT -ne 0) {
+              $boreArgs = "local 3389 --to bore.pub --port $REQUESTED_PORT"
+          }
+
+          $boreProcess = Start-Process -FilePath "C:\bore\bore.exe" `
+            -ArgumentList $boreArgs `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError "C:\bore_error.log" `
+            -PassThru -NoNewWindow
+
+          Write-Host "Bore started (PID: $($boreProcess.Id)). Waiting for tunnel..."
+
+          # --- Wait for bore to establish and print the public address ---
+          $publicAddr = $null
+          for ($i = 1; $i -le 30; $i++) {
+              Start-Sleep -Seconds 2
+              if (Test-Path $logFile) {
+                  $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+                  if ($content -match "listening at (bore\.pub:\d+)") {
+                      $publicAddr = $Matches[1]
+                      break
+                  }
+              }
+              Write-Host "  Waiting... ($i/30)"
+          }
+
+          # --- Display the results ---
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          if ($publicAddr) {
+              Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+              Write-Host "  Public Address : $publicAddr" -ForegroundColor Yellow
+              Write-Host "  Username       : CynetAdmin" -ForegroundColor Yellow
+              Write-Host "  Password       : Cynet@2026" -ForegroundColor Yellow
+              Write-Host "  >> Open mstsc and connect to: $publicAddr" -ForegroundColor Magenta
+              Write-Host ""
+              Write-Host "  !! SECURITY WARNING !!" -ForegroundColor Red
+              Write-Host "  Bore traffic is NOT encrypted. RDP credentials" -ForegroundColor Red
+              Write-Host "  and screen data travel in plaintext. Use at" -ForegroundColor Red
+              Write-Host "  your own risk, or tunnel SSH instead." -ForegroundColor Red
+          } else {
+              Write-Host "  Failed to detect bore public address." -ForegroundColor Red
+              Write-Host "  Check logs below:" -ForegroundColor Red
+              if (Test-Path $logFile) { Get-Content $logFile }
+              if (Test-Path "C:\bore_error.log") { Get-Content "C:\bore_error.log" }
+          }
           Write-Host "==================================================" -ForegroundColor Green
-      - name: 4. Keep Server Alive (6 Hours)
+
+          # Save address to a file for reference
+          if ($publicAddr) {
+              "$publicAddr" | Out-File -FilePath "C:\rdp_address.txt" -Encoding utf8
+          }
+
+      - name: 4. Keep Server Alive & Monitor Bore (6 Hours)
         run: |
           for ($i = 1; $i -le 360; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[$i/360] Server running..."
+            $ts = Get-Date -Format "HH:mm:ss"
+            # Check if bore is still alive
+            $boreRunning = Get-Process -Name "bore" -ErrorAction SilentlyContinue
+            if (-not $boreRunning) {
+              Write-Host "[$i/360] $ts - WARNING: Bore process died!" -ForegroundColor Red
+            } else {
+              Write-Host "[$i/360] $ts - Server running, bore active." -ForegroundColor Green
+            }
           }
