@@ -1,12 +1,12 @@
 name: Windows Cloud RDP Multi-Tunnel
 
-on:
+on: 
   workflow_dispatch:
     inputs:
       tunnel_provider:
         description: 'Choose Tunnel Provider'
         required: true
-        default: 'playit'
+        default: 'pinggy'
         type: choice
         options:
           - 'playit'
@@ -17,16 +17,18 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 360
-
     steps:
-      - name: 1. Setup RDP and User
+      # ----------------------------------------------------------------------
+      # 1. Setup RDP and User
+      # ----------------------------------------------------------------------
+      - name: Setup RDP and User
         shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
-
+          
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           if (-not (Get-LocalUser -Name "CynetAdmin" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires
@@ -35,16 +37,15 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
 
       # ----------------------------------------------------------------------
-      # گزینه ۱: Playit.gg (متن‌باز، TCP مستقیم، بدون نیاز به کلاینت در سیستم شما)
+      # Option 1: Playit.gg (Direct TCP, requires claiming via link)
       # ----------------------------------------------------------------------
-      - name: 2. Launch Playit Tunnel (Direct MSTSC)
+      - name: Launch Playit Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'playit' }}
         shell: powershell
         run: |
-          # دانلود کلاینت رسمی و پرسرعت Playit
           Invoke-WebRequest -Uri "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-windows-x86_64.exe" -OutFile "C:\playit.exe"
-
           $playitLog = "C:\playit.log"
+          
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "C:\playit.exe"
           $psi.Arguments = "run"
@@ -52,10 +53,10 @@ jobs:
           $psi.RedirectStandardOutput = $true
           $psi.UseShellExecute = $false
           $psi.CreateNoWindow = $true
-
+          
           $process = New-Object System.Diagnostics.Process
           $process.StartInfo = $psi
-
+          
           $action = {
               if ($Event.SourceEventArgs.Data) {
                   Add-Content -Path $playitLog -Value $Event.SourceEventArgs.Data
@@ -63,15 +64,15 @@ jobs:
           }
           Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
           Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
-
+          
           $process.Start() | Out-Null
           $process.BeginOutputReadLine()
           $process.BeginErrorReadLine()
-
+          
           Write-Host "Waiting for Playit setup URL..."
           $claimUrl = $null
-          $timeout = [DateTime]::Now.AddSeconds(45)
-
+          $timeout = [DateTime]::Now.AddSeconds(60)
+          
           while ([DateTime]::Now -lt $timeout) {
               if (Test-Path $playitLog) {
                   $content = [System.IO.File]::ReadAllText($playitLog)
@@ -80,9 +81,9 @@ jobs:
                       break
                   }
               }
-              Start-Sleep -Milliseconds 400
+              Start-Sleep -Milliseconds 500
           }
-
+          
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host ">>> PLAYIT RDP TUNNEL STARTED <<<" -ForegroundColor Cyan
@@ -91,18 +92,17 @@ jobs:
           Write-Host "Password  : Cynet@2026" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "Open the link once to bind to RDP (Port 3389 TCP)." -ForegroundColor White
-          Write-Host ""
 
       # ----------------------------------------------------------------------
-      # گزینه ۲: Cloudflare Tunnel (پایدارترین روش، نیاز به cloudflared روی سیستم)
+      # Option 2: Cloudflare Tunnel (Stable, requires cloudflared binary)
       # ----------------------------------------------------------------------
-      - name: 3. Launch Cloudflare Tunnel
+      - name: Launch Cloudflare Tunnel
         if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
         shell: powershell
         run: |
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
-
           $logFile = "C:\cf_output.log"
+          
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "C:\cloudflared.exe"
           $psi.Arguments = "tunnel --url tcp://localhost:3389 --no-autoupdate"
@@ -110,10 +110,10 @@ jobs:
           $psi.RedirectStandardOutput = $true
           $psi.UseShellExecute = $false
           $psi.CreateNoWindow = $true
-
+          
           $process = New-Object System.Diagnostics.Process
           $process.StartInfo = $psi
-
+          
           $action = {
               if ($Event.SourceEventArgs.Data) {
                   Add-Content -Path $logFile -Value $Event.SourceEventArgs.Data
@@ -121,15 +121,15 @@ jobs:
           }
           Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
           Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
-
+          
           $process.Start() | Out-Null
           $process.BeginOutputReadLine()
           $process.BeginErrorReadLine()
-
+          
           Write-Host "Waiting for TryCloudflare Tunnel URL..."
           $domain = $null
           $timeout = [DateTime]::Now.AddSeconds(60)
-
+          
           while ([DateTime]::Now -lt $timeout) {
               if (Test-Path $logFile) {
                   $text = [System.IO.File]::ReadAllText($logFile)
@@ -139,9 +139,9 @@ jobs:
                       break
                   }
               }
-              Start-Sleep -Milliseconds 400
+              Start-Sleep -Milliseconds 500
           }
-
+          
           if ($domain) {
               Write-Host ""
               Write-Host "==================================================" -ForegroundColor Green
@@ -154,33 +154,34 @@ jobs:
               Write-Host "Run this on your PC:" -ForegroundColor Magenta
               Write-Host "cloudflared access rdp --hostname $domain --url rdp://localhost:13389" -ForegroundColor White
               Write-Host "Then connect mstsc to: localhost:13389" -ForegroundColor Magenta
-              Write-Host ""
           } else {
               Write-Host "[!] Failed to get Cloudflare tunnel URL." -ForegroundColor Red
+              if (Test-Path $logFile) { Get-Content $logFile }
               exit 1
           }
 
       # ----------------------------------------------------------------------
-      # گزینه ۳: Pinggy با فورس حالت متنی (رفع باگ Pseudo-terminal با سوییچ -T و p:headless)
+      # Option 3: Pinggy (Free Tier, No Token, Direct TCP)
       # ----------------------------------------------------------------------
-      - name: 4. Launch Pinggy Tunnel (Headless Mode)
+      - name: Launch Pinggy Tunnel (Free Tier)
         if: ${{ github.event.inputs.tunnel_provider == 'pinggy' }}
         shell: powershell
         run: |
           $logFile = "C:\pinggy.log"
           
-          # سوییچ -T مانع از درخواست PTY می‌شود و پارامتر p:headless خروجی ساده متنی برمی‌گرداند
+          # Use free.pinggy.io for no-token access. 
+          # The 'tcp' user prefix ensures we get a raw TCP address suitable for RDP.
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "ssh"
-          $psi.Arguments = "-p 443 -T -o StrictHostKeyChecking=no -R 0:localhost:3389 a.pinggy.io tcp"
+          $psi.Arguments = "-p 443 -T -o StrictHostKeyChecking=no -R 0:localhost:3389 tcp@free.pinggy.io"
           $psi.RedirectStandardError = $true
           $psi.RedirectStandardOutput = $true
           $psi.UseShellExecute = $false
           $psi.CreateNoWindow = $true
-
+          
           $process = New-Object System.Diagnostics.Process
           $process.StartInfo = $psi
-
+          
           $action = {
               if ($Event.SourceEventArgs.Data) {
                   Add-Content -Path $logFile -Value $Event.SourceEventArgs.Data
@@ -188,26 +189,27 @@ jobs:
           }
           Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
           Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
-
+          
           $process.Start() | Out-Null
           $process.BeginOutputReadLine()
           $process.BeginErrorReadLine()
-
+          
           Write-Host "Waiting for Pinggy direct TCP address..."
           $directUrl = $null
-          $timeout = [DateTime]::Now.AddSeconds(45)
-
+          $timeout = [DateTime]::Now.AddSeconds(60)
+          
           while ([DateTime]::Now -lt $timeout) {
               if (Test-Path $logFile) {
                   $content = [System.IO.File]::ReadAllText($logFile)
+                  # Pinggy usually outputs something like: "Your TCP tunnel is ready at tcp://xxxxx.pinggy.io:yyyyy"
                   if ($content -match "tcp://([a-zA-Z0-9\.\-]+:\d+)") {
                       $directUrl = $matches[1]
                       break
                   }
               }
-              Start-Sleep -Milliseconds 400
+              Start-Sleep -Milliseconds 500
           }
-
+          
           if ($directUrl) {
               Write-Host ""
               Write-Host "==================================================" -ForegroundColor Green
@@ -219,14 +221,17 @@ jobs:
               Write-Host "Connect directly via mstsc to: $directUrl" -ForegroundColor White
           } else {
               Write-Host "[!] Could not fetch Pinggy URL." -ForegroundColor Red
-              if (Test-Path $logFile) { Get-Content $logFile }
+              if (Test-Path $logFile) { 
+                  Write-Host "--- Log Content ---"
+                  Get-Content $logFile 
+              }
               exit 1
           }
 
       # ----------------------------------------------------------------------
-      # ۵. زنده نگه داشتن سرور
+      # 5. Keep Alive
       # ----------------------------------------------------------------------
-      - name: 5. Keep Alive
+      - name: Keep Alive
         shell: powershell
         run: |
           for ($i = 1; $i -le 350; $i++) {
