@@ -1,18 +1,16 @@
-name: Windows Cloud RDP - Free Tunnel Multi-Options (No Auth Required)
+name: Windows Cloud RDP (Multi-Tunnel Selector)
 
 on:
   workflow_dispatch:
     inputs:
       tunnel_provider:
-        description: 'Choose Tunnel Provider (All Free - No API Keys Needed)'
+        description: 'Choose Tunnel Provider'
         required: true
-        default: 'pinggy-free'
+        default: 'cloudflare'
         type: choice
         options:
-          - 'pinggy-free'
-          - 'playit-free'
-          - 'bore-pub'
-          - 'serveo'
+          - 'cloudflare'
+          - 'bore'
 
 jobs:
   build:
@@ -20,326 +18,166 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: 1. Setup RDP and User
+      - name: 1. Configure RDP and Admin Account
         shell: powershell
         run: |
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          Write-Host "Setting up Remote Desktop..." -ForegroundColor Cyan
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
+
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           if (-not (Get-LocalUser -Name "CynetAdmin" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires
           }
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          Write-Host "Verifying RDP Port 3389..." -ForegroundColor Yellow
-          $portReady = $false
-          for ($i = 0; $i -lt 15; $i++) {
-              $check = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
-              if ($check.TcpTestSucceeded) {
-                  $portReady = $true
-                  Write-Host "Port 3389 is OPEN and READY!" -ForegroundColor Green
-                  break
-              }
-              Start-Sleep -Seconds 1
-          }
-          if (-not $portReady) {
-              Write-Host "[!] Port 3389 failed to bind." -ForegroundColor Red
-              exit 1
-          }
 
-      # ======================================================================
-      # Option 1: Pinggy Free TCP (FIXED: BatchMode + SSH key, no hang)
-      # ======================================================================
-      - name: 2a. Launch Pinggy Free Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'pinggy-free' }}
+      # ---------------------------------------------------------
+      # گزینه اول: Cloudflare Tunnel
+      # ---------------------------------------------------------
+      - name: 2. Setup Cloudflare Tunnel
+        if: ${{ github.event.inputs.tunnel_provider == 'cloudflare' }}
         shell: powershell
         run: |
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          Write-Host "=====================================================" -ForegroundColor Green
-          Write-Host "Starting Pinggy Free SSH Tunnel (TCP)" -ForegroundColor Cyan
-          Write-Host "=====================================================" -ForegroundColor Green
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
-          if (-not (Test-Path "$env:USERPROFILE\.ssh\id_ed25519")) {
-              Write-Host "Generating SSH key (needed to avoid password prompt)..." -ForegroundColor Yellow
-              ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\id_ed25519" -N '""' -q
+          $logFile = "C:\cf_output.log"
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "C:\cloudflared.exe"
+          $psi.Arguments = "tunnel --url tcp://localhost:3389 --no-autoupdate"
+          $psi.RedirectStandardError = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.UseShellExecute = $false
+          $psi.CreateNoWindow = $true
+
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $psi
+
+          $action = {
+              if ($Event.SourceEventArgs.Data) {
+                  Add-Content -Path $logFile -Value $Event.SourceEventArgs.Data
+              }
           }
+          Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
+          Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
 
-          $logOut = "C:\pinggy_out.log"
-          $logErr = "C:\pinggy_err.log"
-          Remove-Item $logOut, $logErr -Force -ErrorAction SilentlyContinue
+          $process.Start() | Out-Null
+          $process.BeginOutputReadLine()
+          $process.BeginErrorReadLine()
 
-          $sshArgs = @(
-            "-p", "443",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=NUL",
-            "-o", "BatchMode=yes",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "ExitOnForwardFailure=yes",
-            "-R", "0:127.0.0.1:3389",
-            "tcp@free.pinggy.io"
-          )
-
-          Write-Host "Establishing SSH connection to free.pinggy.io..." -ForegroundColor Cyan
-          $proc = Start-Process -FilePath "ssh" -ArgumentList $sshArgs `
-              -RedirectStandardOutput $logOut -RedirectStandardError $logErr `
-              -NoNewWindow -PassThru
-
-          Write-Host "Waiting for Pinggy tunnel address (up to 120s)..." -ForegroundColor Yellow
-          $tunnelAddr = $null
-          $timeout = [DateTime]::Now.AddSeconds(120)
-          $attempts = 0
-
-          while ([DateTime]::Now -lt $timeout) {
-              $attempts++
-              if ($proc.HasExited) {
-                  Write-Host "SSH process exited with code: $($proc.ExitCode)" -ForegroundColor Red
-                  if (Test-Path $logErr) { Get-Content $logErr }
-                  exit 1
-              }
-              $outText = if (Test-Path $logOut) { Get-Content -Path $logOut -Raw -ErrorAction SilentlyContinue } else { "" }
-              $errText = if (Test-Path $logErr) { Get-Content -Path $logErr -Raw -ErrorAction SilentlyContinue } else { "" }
-              $fullText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
-
-              if ($fullText -match "tcp://([a-zA-Z0-9\.\-]+:\d+)") {
-                  $tunnelAddr = $matches[1]; break
-              }
-              if ($fullText -match "([a-zA-Z0-9\.\-]+\.pinggy\.(io|link):\d+)") {
-                  $tunnelAddr = $matches[1]; break
-              }
-              if ($attempts % 10 -eq 0) {
-                  Write-Host "[Waiting...] $attempts seconds elapsed" -ForegroundColor Gray
-              }
-              Start-Sleep -Seconds 1
-          }
-
-          if (-not $tunnelAddr) {
-              Write-Host "[X] Could not get Pinggy tunnel address" -ForegroundColor Red
-              if (Test-Path $logOut) { Write-Host "--- STDOUT ---"; Get-Content $logOut }
-              if (Test-Path $logErr) { Write-Host "--- STDERR ---"; Get-Content $logErr }
-              exit 1
-          }
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "[OK] PINGGY FREE RDP TUNNEL ACTIVE" -ForegroundColor Cyan
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Tunnel Address  : $tunnelAddr" -ForegroundColor Yellow
-          Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Connect Remote Desktop to: $tunnelAddr" -ForegroundColor White
-          Write-Host "Username: CynetAdmin  Password: Cynet@2026" -ForegroundColor White
-          Write-Host "==================================================" -ForegroundColor Green
-
-      # ======================================================================
-      # Option 2: Playit Free (anonymous TCP tunnel, works for RDP)
-      # ======================================================================
-      - name: 2b. Launch Playit Free Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'playit-free' }}
-        shell: powershell
-        run: |
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          Write-Host "=====================================================" -ForegroundColor Green
-          Write-Host "Starting Playit Free Tunnel" -ForegroundColor Cyan
-          Write-Host "=====================================================" -ForegroundColor Green
-
-          Invoke-WebRequest -Uri "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-windows-x86_64.exe" -OutFile "C:\playit.exe" -ErrorAction Stop
-
-          $playitOut = "C:\playit_out.log"
-          $playitErr = "C:\playit_err.log"
-          Remove-Item $playitOut, $playitErr -Force -ErrorAction SilentlyContinue
-
-          $proc = Start-Process -FilePath "C:\playit.exe" `
-              -RedirectStandardOutput $playitOut -RedirectStandardError $playitErr `
-              -NoNewWindow -PassThru
-
-          Write-Host "Waiting for Playit claim URL..." -ForegroundColor Yellow
-          $claimUrl = $null
-          $timeout = [DateTime]::Now.AddSeconds(120)
-          $attempts = 0
-
-          while ([DateTime]::Now -lt $timeout) {
-              $attempts++
-              if ($proc.HasExited) {
-                  Write-Host "Playit exited with code: $($proc.ExitCode)" -ForegroundColor Red
-                  if (Test-Path $playitErr) { Get-Content $playitErr }
-                  exit 1
-              }
-              $outText = if (Test-Path $playitOut) { Get-Content -Path $playitOut -Raw -ErrorAction SilentlyContinue } else { "" }
-              $errText = if (Test-Path $playitErr) { Get-Content -Path $playitErr -Raw -ErrorAction SilentlyContinue } else { "" }
-              $fullText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
-
-              if ($fullText -match "(https://playit\.gg/claim/[a-zA-Z0-9_\-]+)") {
-                  $claimUrl = $matches[1]; break
-              }
-              if ($attempts % 10 -eq 0) { Write-Host "[Waiting...] $attempts seconds elapsed" -ForegroundColor Gray }
-              Start-Sleep -Seconds 1
-          }
-
-          if (-not $claimUrl) {
-              Write-Host "[X] Could not get Playit claim URL" -ForegroundColor Red
-              exit 1
-          }
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "[OK] PLAYIT FREE TUNNEL CLAIM URL" -ForegroundColor Cyan
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Claim Link      : $claimUrl" -ForegroundColor Yellow
-          Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "1. Open: $claimUrl" -ForegroundColor White
-          Write-Host "2. Click 'Claim Tunnel'" -ForegroundColor White
-          Write-Host "3. Set port 3389 (RDP)" -ForegroundColor White
-          Write-Host "4. Connect RDP to the address Playit gives you" -ForegroundColor White
-          Write-Host "==================================================" -ForegroundColor Green
-
-      # ======================================================================
-      # Option 3: bore.pub (simple TCP tunnel, no auth)
-      # ======================================================================
-      - name: 2c. Launch bore.pub Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'bore-pub' }}
-        shell: powershell
-        run: |
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          Write-Host "=====================================================" -ForegroundColor Green
-          Write-Host "Starting bore.pub Tunnel (TCP)" -ForegroundColor Cyan
-          Write-Host "=====================================================" -ForegroundColor Green
-
-          $zip = "C:\bore.zip"
-          $dir = "C:\bore"
-          Remove-Item $zip -Force -ErrorAction SilentlyContinue
-          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
-
-          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip" -OutFile $zip -ErrorAction Stop
-          Expand-Archive -Path $zip -DestinationPath $dir -Force
-
-          $boreExe = Get-ChildItem -Path $dir -Filter "bore.exe" -Recurse | Select-Object -First 1
-          if (-not $boreExe) { Write-Host "bore.exe not found" -ForegroundColor Red; exit 1 }
-
-          $logOut = "C:\bore_out.log"
-          $logErr = "C:\bore_err.log"
-          Remove-Item $logOut, $logErr -Force -ErrorAction SilentlyContinue
-
-          Write-Host "Starting bore local 3389 --to bore.pub ..." -ForegroundColor Cyan
-          $proc = Start-Process -FilePath $boreExe.FullName -ArgumentList @("local","3389","--to","bore.pub") `
-              -RedirectStandardOutput $logOut -RedirectStandardError $logErr -NoNewWindow -PassThru
-
-          Write-Host "Waiting for bore tunnel address..." -ForegroundColor Yellow
-          $tunnelAddr = $null
+          Write-Host "Waiting for Cloudflare URL..."
+          $domain = $null
           $timeout = [DateTime]::Now.AddSeconds(60)
-          $attempts = 0
 
           while ([DateTime]::Now -lt $timeout) {
-              $attempts++
-              if ($proc.HasExited) { Write-Host "bore exited"; exit 1 }
-              $outText = if (Test-Path $logOut) { Get-Content -Path $logOut -Raw -ErrorAction SilentlyContinue } else { "" }
-              $errText = if (Test-Path $logErr) { Get-Content -Path $logErr -Raw -ErrorAction SilentlyContinue } else { "" }
-              $fullText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
-
-              if ($fullText -match "bore\.pub:(\d+)") {
-                  $tunnelAddr = "bore.pub:$($matches[1])"; break
+              if (Test-Path $logFile) {
+                  $text = [System.IO.File]::ReadAllText($logFile)
+                  $match = [System.Text.RegularExpressions.Regex]::Match($text, "https://([a-zA-Z0-9-]+\.trycloudflare\.com)")
+                  if ($match.Success) {
+                      $domain = $match.Groups[1].Value
+                      break
+                  }
               }
-              if ($attempts % 10 -eq 0) { Write-Host "[Waiting...] $attempts seconds elapsed" -ForegroundColor Gray }
-              Start-Sleep -Seconds 1
+              Start-Sleep -Milliseconds 400
           }
 
-          if (-not $tunnelAddr) { Write-Host "[X] Could not get bore address" -ForegroundColor Red; exit 1 }
+          if ($domain) {
+              Write-Host ""
+              Write-Host "==================================================" -ForegroundColor Green
+              Write-Host ">>> CLOUDFLARE RDP READY <<<" -ForegroundColor Cyan
+              Write-Host "Domain   : $domain" -ForegroundColor Yellow
+              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
+              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
+              Write-Host "==================================================" -ForegroundColor Green
+              Write-Host ""
+              Write-Host "Run this on your PC:" -ForegroundColor Magenta
+              Write-Host "cloudflared access rdp --hostname $domain --url rdp://localhost:13389" -ForegroundColor White
+              Write-Host "Then connect mstsc to: localhost:13389" -ForegroundColor Magenta
+              Write-Host ""
+          } else {
+              Write-Host "[!] Could not fetch domain." -ForegroundColor Red
+              exit 1
+          }
 
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "[OK] BORE.PUB RDP TUNNEL ACTIVE" -ForegroundColor Cyan
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Tunnel Address  : $tunnelAddr" -ForegroundColor Yellow
-          Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Connect Remote Desktop to: $tunnelAddr" -ForegroundColor White
-
-      # ======================================================================
-      # Option 4: Serveo (SSH reverse tunnel, no auth, TCP)
-      # ======================================================================
-      - name: 2d. Launch Serveo Tunnel
-        if: ${{ github.event.inputs.tunnel_provider == 'serveo' }}
+      # ---------------------------------------------------------
+      # گزینه دوم: Bore (متن‌باز، TCP مستقیم بدون نیاز به کلاینت اضافی)
+      # ---------------------------------------------------------
+      - name: 3. Setup Bore Tunnel (Open Source & No-Client Needed)
+        if: ${{ github.event.inputs.tunnel_provider == 'bore' }}
         shell: powershell
         run: |
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          Write-Host "=====================================================" -ForegroundColor Green
-          Write-Host "Starting Serveo Tunnel (TCP over SSH)" -ForegroundColor Cyan
-          Write-Host "=====================================================" -ForegroundColor Green
+          # دانلود کامپوننت متن‌باز bore
+          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip" -OutFile "C:\bore.zip"
+          Expand-Archive -Path "C:\bore.zip" -DestinationPath "C:\" -Force
 
-          $logOut = "C:\serveo_out.log"
-          $logErr = "C:\serveo_err.log"
-          Remove-Item $logOut, $logErr -Force -ErrorAction SilentlyContinue
+          $boreLog = "C:\bore.log"
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "C:\bore.exe"
+          $psi.Arguments = "local 3389 --to bore.pub"
+          $psi.RedirectStandardError = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.UseShellExecute = $false
+          $psi.CreateNoWindow = $true
 
-          if (-not (Test-Path "$env:USERPROFILE\.ssh\id_ed25519")) {
-              ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\id_ed25519" -N '""' -q
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $psi
+
+          $action = {
+              if ($Event.SourceEventArgs.Data) {
+                  Add-Content -Path $boreLog -Value $Event.SourceEventArgs.Data
+              }
           }
+          Register-ObjectEvent -InputObject $process -EventName "OutputDataReceived" -Action $action | Out-Null
+          Register-ObjectEvent -InputObject $process -EventName "ErrorDataReceived" -Action $action | Out-Null
 
-          $sshArgs = @(
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=NUL",
-            "-o", "BatchMode=yes",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ExitOnForwardFailure=yes",
-            "-R", "0:127.0.0.1:3389",
-            "serveo.net"
-          )
+          $process.Start() | Out-Null
+          $process.BeginOutputReadLine()
+          $process.BeginErrorReadLine()
 
-          $proc = Start-Process -FilePath "ssh" -ArgumentList $sshArgs `
-              -RedirectStandardOutput $logOut -RedirectStandardError $logErr -NoNewWindow -PassThru
-
-          Write-Host "Waiting for Serveo tunnel address..." -ForegroundColor Yellow
-          $tunnelAddr = $null
-          $timeout = [DateTime]::Now.AddSeconds(60)
-          $attempts = 0
+          Write-Host "Waiting for Bore port assignment..."
+          $port = $null
+          $timeout = [DateTime]::Now.AddSeconds(30)
 
           while ([DateTime]::Now -lt $timeout) {
-              $attempts++
-              if ($proc.HasExited) { Write-Host "SSH exited"; if (Test-Path $logErr) { Get-Content $logErr }; exit 1 }
-              $outText = if (Test-Path $logOut) { Get-Content -Path $logOut -Raw -ErrorAction SilentlyContinue } else { "" }
-              $errText = if (Test-Path $logErr) { Get-Content -Path $logErr -Raw -ErrorAction SilentlyContinue } else { "" }
-              $fullText = "$outText`n$errText" -replace '\x1b\[[0-9;]*[a-zA-Z]', ''
-
-              if ($fullText -match "serveo\.net:(\d+)") {
-                  $tunnelAddr = "serveo.net:$($matches[1])"; break
+              if (Test-Path $boreLog) {
+                  $text = [System.IO.File]::ReadAllText($boreLog)
+                  # نمونه خروجی: listening at bore.pub:12345
+                  $match = [System.Text.RegularExpressions.Regex]::Match($text, "bore\.pub:(\d+)")
+                  if ($match.Success) {
+                      $port = $match.Groups[1].Value
+                      break
+                  }
               }
-              if ($attempts % 10 -eq 0) { Write-Host "[Waiting...] $attempts seconds elapsed" -ForegroundColor Gray }
-              Start-Sleep -Seconds 1
+              Start-Sleep -Milliseconds 400
           }
 
-          if (-not $tunnelAddr) { Write-Host "[X] Could not get Serveo address" -ForegroundColor Red; exit 1 }
+          if ($port) {
+              Write-Host ""
+              Write-Host "==================================================" -ForegroundColor Green
+              Write-Host ">>> BORE DIRECT RDP READY <<<" -ForegroundColor Cyan
+              Write-Host "Address  : bore.pub:$port" -ForegroundColor Yellow
+              Write-Host "Username : CynetAdmin" -ForegroundColor Yellow
+              Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
+              Write-Host "==================================================" -ForegroundColor Green
+              Write-Host ""
+              Write-Host "NO EXTRA SOFTWARE NEEDED!" -ForegroundColor Cyan
+              Write-Host "Just open Remote Desktop Connection (mstsc) and connect directly to:" -ForegroundColor Magenta
+              Write-Host "bore.pub:$port" -ForegroundColor White
+              Write-Host ""
+          } else {
+              Write-Host "[!] Could not fetch Bore port." -ForegroundColor Red
+              if (Test-Path $boreLog) { Get-Content $boreLog }
+              exit 1
+          }
 
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "[OK] SERVEO RDP TUNNEL ACTIVE" -ForegroundColor Cyan
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Tunnel Address  : $tunnelAddr" -ForegroundColor Yellow
-          Write-Host "RDP Username    : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "RDP Password    : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Connect Remote Desktop to: $tunnelAddr" -ForegroundColor White
-
-      - name: 3. Keep Tunnel Alive
+      # ---------------------------------------------------------
+      # زنده نگه داشتن سیستم
+      # ---------------------------------------------------------
+      - name: 4. Keep Alive
         shell: powershell
         run: |
-          $OutputEncoding = [System.Text.Encoding]::UTF8
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          Write-Host ""
-          Write-Host "Tunnel is active! Session will remain open..." -ForegroundColor Green
           for ($i = 1; $i -le 350; $i++) {
               Start-Sleep -Seconds 60
-              Write-Host "[$i/350 min] Tunnel still active" -ForegroundColor Green
+              Write-Host "[$i/350 min] Runner listening..."
           }
-          Write-Host "Workflow timeout reached. Tunnel session ending." -ForegroundColor Yellow
