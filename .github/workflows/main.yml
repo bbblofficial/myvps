@@ -14,7 +14,6 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
-          # Ensure RDP service is running
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService
 
@@ -27,20 +26,20 @@ jobs:
 
       - name: 3. Install & Start Bore Tunnel for RDP (Port 3389)
         run: |
-          # --- Download bore ---
-          $url = "https://github.com/ekzhang/bore/releases/latest/download/bore-x86_64-pc-windows-msvc.zip"
+          # --- Download bore (FIXED: using specific version v0.6.0) ---
+          $url = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
           Invoke-WebRequest -Uri $url -OutFile "C:\bore.zip"
           Expand-Archive -Path "C:\bore.zip" -DestinationPath "C:\bore" -Force
           Write-Host "Bore downloaded and extracted."
 
           # --- Start bore in background, capture output to a log file ---
           $logFile = "C:\bore_output.log"
+          $errorLogFile = "C:\bore_error.log"
           if (Test-Path $logFile) { Remove-Item $logFile -Force }
+          if (Test-Path $errorLogFile) { Remove-Item $errorLogFile -Force }
 
-          # Use --port 0 to let server assign random port, OR specify a port like 45678
-          # Change REQUESTED_PORT to a number if you want a specific public port
+          # Use --port 0 to let server assign a random port
           $REQUESTED_PORT = 0
-
           $boreArgs = "local 3389 --to bore.pub"
           if ($REQUESTED_PORT -ne 0) {
               $boreArgs = "local 3389 --to bore.pub --port $REQUESTED_PORT"
@@ -49,7 +48,7 @@ jobs:
           $boreProcess = Start-Process -FilePath "C:\bore\bore.exe" `
             -ArgumentList $boreArgs `
             -RedirectStandardOutput $logFile `
-            -RedirectStandardError "C:\bore_error.log" `
+            -RedirectStandardError $errorLogFile `
             -PassThru -NoNewWindow
 
           Write-Host "Bore started (PID: $($boreProcess.Id)). Waiting for tunnel..."
@@ -86,11 +85,10 @@ jobs:
               Write-Host "  Failed to detect bore public address." -ForegroundColor Red
               Write-Host "  Check logs below:" -ForegroundColor Red
               if (Test-Path $logFile) { Get-Content $logFile }
-              if (Test-Path "C:\bore_error.log") { Get-Content "C:\bore_error.log" }
+              if (Test-Path $errorLogFile) { Get-Content $errorLogFile }
           }
           Write-Host "==================================================" -ForegroundColor Green
 
-          # Save address to a file for reference
           if ($publicAddr) {
               "$publicAddr" | Out-File -FilePath "C:\rdp_address.txt" -Encoding utf8
           }
@@ -100,7 +98,6 @@ jobs:
           for ($i = 1; $i -le 360; $i++) {
             Start-Sleep -Seconds 60
             $ts = Get-Date -Format "HH:mm:ss"
-            # Check if bore is still alive
             $boreRunning = Get-Process -Name "bore" -ErrorAction SilentlyContinue
             if (-not $boreRunning) {
               Write-Host "[$i/360] $ts - WARNING: Bore process died!" -ForegroundColor Red
