@@ -1,12 +1,17 @@
-name: AI Web Panel via TryCloudflare (All-in-One)
+name: Ollama AI Web Panel via TryCloudflare
 
 on:
   workflow_dispatch:
+    inputs:
+      model:
+        description: 'Ollama model to pull (e.g., qwen2.5:7b, llama3.1:8b)'
+        required: true
+        default: 'qwen2.5:7b'
 
 jobs:
   run-ai:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # Max 6 hours
+    timeout-minutes: 360  # Max 6 hours
 
     steps:
       - name: Checkout repository
@@ -15,25 +20,35 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget curl unzip python3
+          sudo apt-get install -y curl wget python3
 
-      - name: Download latest llama.cpp prebuilt binaries
+      - name: Install Ollama
         run: |
-          TAG=$(curl -s https://api.github.com/repos/ggerganov/llama.cpp/releases/latest \
-                | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "Using llama.cpp release: $TAG"
-          wget -q "https://github.com/ggerganov/llama.cpp/releases/download/${TAG}/llama-${TAG}-bin-ubuntu-x64.zip" -O llama.zip
-          unzip -o llama.zip -d llama
-          LLAMA_SERVER=$(find llama -name llama-server -type f | head -n 1)
-          chmod +x "$LLAMA_SERVER"
-          echo "LLAMA_SERVER=$LLAMA_SERVER" >> $GITHUB_ENV
+          # Official install script – works on Ubuntu runners.
+          curl -fsSL https://ollama.com/install.sh | sh
+          echo "Ollama installed."
+          ollama --version
 
-      - name: Download model (Qwen2.5-7B-Instruct Q4_K_M)
+      - name: Start Ollama server
         run: |
-          mkdir -p models
-          # ~4.7 GB download, fits comfortably in 16 GB RAM
-          wget -q https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf -O models/model.gguf
-          ls -lh models/
+          # Start the server in the background and wait for it to be ready.
+          ollama serve > ollama.log 2>&1 &
+          echo "Waiting for Ollama to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+              echo "Ollama is ready."
+              break
+            fi
+            sleep 2
+          done
+          curl -s http://localhost:11434/api/tags || echo "health check failed"
+
+      - name: Pull model
+        run: |
+          echo "Pulling model: ${{ github.event.inputs.model }}"
+          ollama pull ${{ github.event.inputs.model }}
+          echo "Model pulled."
+          ollama list
 
       - name: Create custom web panel (index.html)
         run: |
@@ -44,29 +59,20 @@ jobs:
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Local LLM Panel</title>
+            <title>Ollama Web Panel</title>
             <style>
               * { box-sizing: border-box; }
               body {
                 font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-                max-width: 860px;
-                margin: 2rem auto;
-                padding: 0 1rem;
-                background: #f5f5f5;
-                color: #222;
+                max-width: 860px; margin: 2rem auto; padding: 0 1rem;
+                background: #f5f5f5; color: #222;
               }
               h1 { font-size: 1.4rem; margin-bottom: .25rem; }
               .sub { color: #666; font-size: .85rem; margin-bottom: 1rem; }
               #log {
-                background: #fff;
-                border: 1px solid #ddd;
-                border-radius: 10px;
-                padding: 1rem;
-                min-height: 380px;
-                max-height: 60vh;
-                overflow-y: auto;
-                white-space: pre-wrap;
-                line-height: 1.5;
+                background: #fff; border: 1px solid #ddd; border-radius: 10px;
+                padding: 1rem; min-height: 380px; max-height: 60vh;
+                overflow-y: auto; white-space: pre-wrap; line-height: 1.5;
                 font-size: .95rem;
               }
               .msg { margin-bottom: .8rem; }
@@ -74,33 +80,22 @@ jobs:
               .msg.ai { color: #222; }
               .msg.err { color: #b00; }
               textarea {
-                width: 100%;
-                height: 70px;
-                margin-top: .75rem;
-                padding: .6rem;
-                border: 1px solid #ccc;
-                border-radius: 8px;
-                font-family: inherit;
-                font-size: .95rem;
-                resize: vertical;
+                width: 100%; height: 70px; margin-top: .75rem; padding: .6rem;
+                border: 1px solid #ccc; border-radius: 8px;
+                font-family: inherit; font-size: .95rem; resize: vertical;
               }
               .row { display: flex; gap: .5rem; margin-top: .5rem; }
               button {
-                padding: .55rem 1.2rem;
-                border: 0;
-                border-radius: 8px;
-                background: #222;
-                color: #fff;
-                font-size: .95rem;
-                cursor: pointer;
+                padding: .55rem 1.2rem; border: 0; border-radius: 8px;
+                background: #222; color: #fff; font-size: .95rem; cursor: pointer;
               }
               button:disabled { opacity: .5; cursor: not-allowed; }
               .status { font-size: .8rem; color: #888; margin-left: auto; align-self: center; }
             </style>
           </head>
           <body>
-            <h1>Local LLM Web Panel</h1>
-            <div class="sub">Powered by llama.cpp &middot; CPU inference</div>
+            <h1>Ollama Web Panel</h1>
+            <div class="sub">Model: ${{ github.event.inputs.model }} · CPU inference</div>
             <div id="log"></div>
             <textarea id="q" placeholder="Ask something... (Ctrl+Enter to send)"></textarea>
             <div class="row">
@@ -108,11 +103,10 @@ jobs:
               <button onclick="clearLog()" style="background:#888">Clear</button>
               <span class="status" id="status">Ready</span>
             </div>
-
           <script>
             // Replace this with your actual API tunnel URL after the workflow runs.
-            // The workflow will print both URLs in the job summary.
             const API_BASE = "__API_BASE_URL__";
+            const MODEL   = "${{ github.event.inputs.model }}";
 
             const log = document.getElementById('log');
             const qEl = document.getElementById('q');
@@ -140,11 +134,12 @@ jobs:
               btn.disabled = true;
               status.textContent = 'Thinking...';
               try {
+                // Ollama exposes an OpenAI-compatible endpoint at /v1/chat/completions
                 const r = await fetch(API_BASE + '/v1/chat/completions', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
-                    model: 'local',
+                    model: MODEL,
                     messages: [{ role: 'user', content: q }],
                     stream: false
                   })
@@ -162,7 +157,6 @@ jobs:
                 qEl.focus();
               }
             }
-
             qEl.addEventListener('keydown', (e) => {
               if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send();
             });
@@ -173,21 +167,6 @@ jobs:
           EOF
           echo "Web panel created at web/index.html"
           ls -lh web/
-
-      - name: Start llama.cpp server
-        run: |
-          ${{ env.LLAMA_SERVER }} -m models/model.gguf \
-            --host 0.0.0.0 --port 8080 \
-            --ctx-size 4096 --threads 4 > llama.log 2>&1 &
-          echo "Waiting for llama-server to start..."
-          for i in {1..30}; do
-            if curl -s http://localhost:8080/health > /dev/null 2>&1; then
-              echo "llama-server is ready."
-              break
-            fi
-            sleep 2
-          done
-          curl -s http://localhost:8080/health || echo "health check failed"
 
       - name: Start static web panel server
         run: |
@@ -202,18 +181,15 @@ jobs:
           chmod +x cloudflared
           # Tunnel 1: custom web panel on port 3000
           ./cloudflared tunnel --url http://localhost:3000 --no-autoupdate > cf-web.log 2>&1 &
-          # Tunnel 2: llama.cpp API on port 8080
-          ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate > cf-api.log 2>&1 &
+          # Tunnel 2: Ollama API on port 11434
+          ./cloudflared tunnel --url http://localhost:11434 --no-autoupdate > cf-api.log 2>&1 &
 
           echo "Waiting for both Cloudflare tunnel URLs..."
-          WEB_URL=""
-          API_URL=""
+          WEB_URL=""; API_URL=""
           for i in {1..40}; do
             WEB_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf-web.log 2>/dev/null | head -n 1)
             API_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf-api.log 2>/dev/null | head -n 1)
-            if [ -n "$WEB_URL" ] && [ -n "$API_URL" ]; then
-              break
-            fi
+            if [ -n "$WEB_URL" ] && [ -n "$API_URL" ]; then break; fi
             sleep 2
           done
 
@@ -228,7 +204,7 @@ jobs:
           echo "API_URL=$API_URL" >> $GITHUB_ENV
 
           {
-            echo "### 🚀 AI Web Panel is live!"
+            echo "### 🚀 Ollama Web Panel is live!"
             echo ""
             echo "**Web panel (custom UI):** $WEB_URL"
             echo ""
@@ -248,11 +224,7 @@ jobs:
 
       - name: Patch web panel with the API URL (optional)
         run: |
-          # Replace the placeholder in the served HTML with the real API tunnel URL.
-          # Note: this patches the file on disk, but the Python server may have already cached it.
-          # For a live patch, restart the web server after patching.
           sed -i "s|__API_BASE_URL__|${{ env.API_URL }}|g" web/index.html
-          # Restart the static server so it serves the updated file.
           pkill -f "http.server 3000" || true
           cd web
           python3 -m http.server 3000 > ../web.log 2>&1 &
