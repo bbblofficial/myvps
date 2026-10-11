@@ -1,4 +1,4 @@
-name: Ollama AI Web Panel via TryCloudflare
+name: Ollama AI Web Panel via TryCloudflare (Fixed CORS + 403)
 
 on:
   workflow_dispatch:
@@ -24,14 +24,16 @@ jobs:
 
       - name: Install Ollama
         run: |
-          # Official install script – works on Ubuntu runners.
           curl -fsSL https://ollama.com/install.sh | sh
           echo "Ollama installed."
           ollama --version
 
-      - name: Start Ollama server
+      - name: Start Ollama server with CORS enabled
         run: |
-          # Start the server in the background and wait for it to be ready.
+          # Allow all origins so the web panel's tunnel URL can reach the API.
+          # For tighter security, replace '*' with your specific trycloudflare panel URL.
+          export OLLAMA_ORIGINS='*'
+          export OLLAMA_HOST='0.0.0.0:11434'
           ollama serve > ollama.log 2>&1 &
           echo "Waiting for Ollama to start..."
           for i in {1..30}; do
@@ -104,7 +106,7 @@ jobs:
               <span class="status" id="status">Ready</span>
             </div>
           <script>
-            // Replace this with your actual API tunnel URL after the workflow runs.
+            // The workflow will patch this with the real API tunnel URL.
             const API_BASE = "__API_BASE_URL__";
             const MODEL   = "${{ github.event.inputs.model }}";
 
@@ -134,10 +136,16 @@ jobs:
               btn.disabled = true;
               status.textContent = 'Thinking...';
               try {
-                // Ollama exposes an OpenAI-compatible endpoint at /v1/chat/completions
                 const r = await fetch(API_BASE + '/v1/chat/completions', {
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
+                  headers: {
+                    'Content-Type': 'application/json',
+                    // Explicitly request CORS permission from the browser.
+                    'Accept': 'application/json'
+                  },
+                  // Include credentials is not needed here, but some browsers
+                  // require the mode to be set for cross-origin requests.
+                  mode: 'cors',
                   body: JSON.stringify({
                     model: MODEL,
                     messages: [{ role: 'user', content: q }],
@@ -179,10 +187,19 @@ jobs:
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
           chmod +x cloudflared
+
           # Tunnel 1: custom web panel on port 3000
-          ./cloudflared tunnel --url http://localhost:3000 --no-autoupdate > cf-web.log 2>&1 &
+          # --http-host-header tells Cloudflare to forward the correct Host header,
+          # avoiding 403 errors from Bot Fight Mode / WAF.
+          ./cloudflared tunnel --url http://localhost:3000 \
+            --http-host-header localhost:3000 \
+            --no-autoupdate > cf-web.log 2>&1 &
+
           # Tunnel 2: Ollama API on port 11434
-          ./cloudflared tunnel --url http://localhost:11434 --no-autoupdate > cf-api.log 2>&1 &
+          # Same --http-host-header fix for the API tunnel.
+          ./cloudflared tunnel --url http://localhost:11434 \
+            --http-host-header localhost:11434 \
+            --no-autoupdate > cf-api.log 2>&1 &
 
           echo "Waiting for both Cloudflare tunnel URLs..."
           WEB_URL=""; API_URL=""
@@ -212,17 +229,14 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "⚠️ **Important:** The web panel's \`API_BASE\` is currently set to a placeholder."
-            echo "To make the panel work, you must do one of the following:"
-            echo ""
-            echo "1. **Edit the web panel after tunnel is up** (easiest for testing):"
-            echo "   - The workflow will patch the placeholder below if you enable the optional step."
-            echo "2. **Or manually update** \`API_BASE\` in \`web/index.html\` with the API URL above and re-run."
+            echo "⚠️ **CORS is enabled with OLLAMA_ORIGINS=*.**"
+            echo "The web panel is automatically patched with the API URL below."
+            echo "If the page was already loaded, do a hard refresh (Ctrl+Shift+R)."
             echo ""
             echo "Links expire when the job stops (max 6 hours)."
           } >> $GITHUB_STEP_SUMMARY
 
-      - name: Patch web panel with the API URL (optional)
+      - name: Patch web panel with the API URL
         run: |
           sed -i "s|__API_BASE_URL__|${{ env.API_URL }}|g" web/index.html
           pkill -f "http.server 3000" || true
