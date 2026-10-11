@@ -275,11 +275,11 @@ jobs:
           </body>
           </html>
           EOF
-
       - name: Setup Caddy Reverse Proxy
         run: |
-          # Use Caddy for a secure, zero-config, high-performance streaming proxy
-          wget -qO caddy "https://caddyserver.com/api/download?os=linux&arch=amd64"
+          # Fetch stable Caddy binary from GitHub Releases (avoids rate limits from the dynamic build API)
+          wget -qO caddy.tar.gz "https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz"
+          tar -xzf caddy.tar.gz caddy
           chmod +x caddy
           
           cat > Caddyfile << 'EOF'
@@ -294,12 +294,25 @@ jobs:
           }
           EOF
           
+          # Start Caddy in the background
           ./caddy run --config Caddyfile > caddy.log 2>&1 &
           
-          # Health check Caddy
-          sleep 2
-          curl -s http://127.0.0.1:3000/ > /dev/null && echo "Caddy web server running."
-
+          # Poll to check if Caddy is alive (prevents race conditions)
+          echo "Waiting for Caddy to start..."
+          for i in {1..15}; do
+            if curl -s http://127.0.0.1:3000/ > /dev/null; then
+              echo "Caddy web server is running."
+              break
+            fi
+            sleep 1
+          done
+          
+          # If it still fails, print the log to help us debug
+          if ! curl -s http://127.0.0.1:3000/ > /dev/null; then
+            echo "Failed to start Caddy. Log output:"
+            cat caddy.log
+            exit 1
+          fi
       - name: Start Cloudflare Tunnel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
