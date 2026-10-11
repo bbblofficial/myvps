@@ -1,4 +1,4 @@
-name: Ollama Web Panel via TryCloudflare (Same-Origin)
+name: Ollama Web Panel via TryCloudflare (Enhanced)
 
 on:
   workflow_dispatch:
@@ -14,259 +14,310 @@ jobs:
     timeout-minutes: 360  # Max 6 hours
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl wget python3
+          sudo apt-get install -y curl wget jq
 
-      - name: Install Ollama
+      - name: Install & Start Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
-          echo "Ollama installed."
-          ollama --version
-
-      - name: Start Ollama server with CORS enabled
-        run: |
-          # Allow all origins. Since the browser will now talk to the proxy (same origin),
-          # this is less critical, but it helps if you ever test directly.
+          
+          # Start Ollama in background
           export OLLAMA_ORIGINS='*'
-          export OLLAMA_HOST='0.0.0.0:11434'
+          export OLLAMA_HOST='127.0.0.1:11434'
           ollama serve > ollama.log 2>&1 &
+          
           echo "Waiting for Ollama to start..."
           for i in {1..30}; do
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            if curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
               echo "Ollama is ready."
               break
             fi
             sleep 2
           done
-          curl -s http://localhost:11434/api/tags || echo "health check failed"
 
-      - name: Pull model
+      - name: Pull Model
         run: |
           echo "Pulling model: ${{ github.event.inputs.model }}"
           ollama pull ${{ github.event.inputs.model }}
-          echo "Model pulled."
           ollama list
 
-      - name: Create same-origin proxy server and web panel
+      - name: Build Web UI
         run: |
           mkdir -p web
-          # The proxy server serves the HTML and forwards /api/* calls to Ollama.
-          cat > web/server.py << 'PYEOF'
-          #!/usr/bin/env python3
-          """
-          Simple same-origin proxy server.
-          - Serves the chat UI at /
-          - Forwards /api/* and /v1/* requests to the local Ollama instance.
-          """
-          import http.server
-          import socketserver
-          import urllib.request
-          import urllib.error
-          import json
-          import os
-
-          OLLAMA_BASE = "http://localhost:11434"
-
-          class ProxyHandler(http.server.SimpleHTTPRequestHandler):
-              def do_GET(self):
-                  if self.path.startswith("/api/") or self.path.startswith("/v1/"):
-                      self.proxy_request()
-                  else:
-                      # Serve static files (index.html)
-                      super().do_GET()
-
-              def do_POST(self):
-                  if self.path.startswith("/api/") or self.path.startswith("/v1/"):
-                      self.proxy_request()
-                  else:
-                      self.send_error(405, "Method Not Allowed")
-
-              def proxy_request(self):
-                  target_url = OLLAMA_BASE + self.path
-                  content_length = int(self.headers.get("Content-Length", 0))
-                  body = self.rfile.read(content_length) if content_length > 0 else None
-
-                  req = urllib.request.Request(
-                      target_url,
-                      data=body,
-                      method=self.command,
-                      headers={
-                          "Content-Type": self.headers.get("Content-Type", "application/json"),
-                          "Host": "localhost:11434",
-                      }
-                  )
-
-                  try:
-                      with urllib.request.urlopen(req) as resp:
-                          self.send_response(resp.status)
-                          for k, v in resp.headers.items():
-                              if k.lower() not in ["transfer-encoding", "connection"]:
-                                  self.send_header(k, v)
-                          self.end_headers()
-                          self.wfile.write(resp.read())
-                  except urllib.error.HTTPError as e:
-                      self.send_response(e.code)
-                      self.end_headers()
-                      self.wfile.write(e.read())
-                  except Exception as e:
-                      self.send_error(502, f"Proxy error: {e}")
-
-              def log_message(self, format, *args):
-                  # Quieter logging
-                  pass
-
-          PORT = 3000
-          os.chdir(os.path.dirname(os.path.abspath(__file__)))
-          with socketserver.ThreadingTCPServer(("", PORT), ProxyHandler) as httpd:
-              print(f"Proxy server running on port {PORT}")
-              httpd.serve_forever()
-          PYEOF
-
-          # Create the web panel HTML (it talks to /api/chat on the same origin).
           cat > web/index.html << 'EOF'
           <!doctype html>
           <html lang="en">
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Ollama Web Panel</title>
+            <title>Ollama Web UI</title>
+            <!-- Markdown, Purify, and Syntax Highlighting -->
+            <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+            <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+            
             <style>
-              * { box-sizing: border-box; }
-              body {
-                font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-                max-width: 860px; margin: 2rem auto; padding: 0 1rem;
-                background: #f5f5f5; color: #222;
-              }
-              h1 { font-size: 1.4rem; margin-bottom: .25rem; }
-              .sub { color: #666; font-size: .85rem; margin-bottom: 1rem; }
-              #log {
-                background: #fff; border: 1px solid #ddd; border-radius: 10px;
-                padding: 1rem; min-height: 380px; max-height: 60vh;
-                overflow-y: auto; white-space: pre-wrap; line-height: 1.5;
-                font-size: .95rem;
-              }
-              .msg { margin-bottom: .8rem; }
-              .msg.user { color: #0b5; }
-              .msg.ai { color: #222; }
-              .msg.err { color: #b00; }
-              textarea {
-                width: 100%; height: 70px; margin-top: .75rem; padding: .6rem;
-                border: 1px solid #ccc; border-radius: 8px;
-                font-family: inherit; font-size: .95rem; resize: vertical;
-              }
-              .row { display: flex; gap: .5rem; margin-top: .5rem; }
-              button {
-                padding: .55rem 1.2rem; border: 0; border-radius: 8px;
-                background: #222; color: #fff; font-size: .95rem; cursor: pointer;
-              }
-              button:disabled { opacity: .5; cursor: not-allowed; }
-              .status { font-size: .8rem; color: #888; margin-left: auto; align-self: center; }
+              :root { --bg: #f9fafb; --chat-bg: #ffffff; --primary: #10b981; --text: #1f2937; --border: #e5e7eb; }
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+              
+              /* Header */
+              header { background: var(--chat-bg); padding: 1rem 2rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+              .title { font-weight: 600; font-size: 1.25rem; }
+              .badge { background: #ecfdf5; color: #047857; padding: 0.25rem 0.75rem; border-radius: 999px; font-size: 0.875rem; font-weight: 500; }
+              
+              /* Chat Area */
+              #chat { flex: 1; overflow-y: auto; padding: 2rem; display: flex; flex-direction: column; gap: 1.5rem; scroll-behavior: smooth; }
+              .message { max-width: 800px; margin: 0 auto; width: 100%; display: flex; gap: 1rem; line-height: 1.6; }
+              .message.user { flex-direction: row-reverse; }
+              .avatar { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: bold; flex-shrink: 0; }
+              .user .avatar { background: var(--primary); color: white; }
+              .ai .avatar { background: #374151; color: white; }
+              .content { padding: 0.75rem 1.25rem; border-radius: 12px; background: var(--chat-bg); border: 1px solid var(--border); overflow-x: auto; width: 100%; }
+              .user .content { background: #ecfdf5; border-color: #d1fae5; }
+              
+              /* Markdown Styles */
+              .content pre { background: #1f2937; color: #f8f8f2; padding: 1rem; border-radius: 8px; overflow-x: auto; margin: 0.75rem 0; }
+              .content code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.9em; padding: 0.2em 0.4em; border-radius: 4px; background: rgba(0,0,0,0.05); }
+              .content pre code { padding: 0; background: transparent; }
+              .content p { margin-bottom: 0.75rem; }
+              .content p:last-child { margin-bottom: 0; }
+              .content table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+              .content th, .content td { border: 1px solid var(--border); padding: 0.5rem; text-align: left; }
+              
+              /* Input Area */
+              .input-container { background: var(--chat-bg); padding: 1.5rem 2rem; border-top: 1px solid var(--border); display: flex; justify-content: center; }
+              .input-box { max-width: 800px; width: 100%; display: flex; gap: 1rem; background: var(--bg); padding: 0.75rem; border-radius: 12px; border: 1px solid var(--border); align-items: flex-end; }
+              textarea { flex: 1; border: none; background: transparent; resize: none; max-height: 200px; font-family: inherit; font-size: 1rem; padding: 0.25rem; outline: none; }
+              .controls { display: flex; gap: 0.5rem; }
+              button { padding: 0.5rem 1rem; border: none; border-radius: 8px; font-weight: 500; cursor: pointer; transition: opacity 0.2s; }
+              button:disabled { opacity: 0.5; cursor: not-allowed; }
+              .btn-send { background: var(--primary); color: white; }
+              .btn-stop { background: #ef4444; color: white; display: none; }
+              
+              .cursor { display: inline-block; width: 8px; height: 1em; background: currentColor; animation: blink 1s step-end infinite; vertical-align: middle; margin-left: 2px; }
+              @keyframes blink { 50% { opacity: 0; } }
             </style>
           </head>
           <body>
-            <h1>Ollama Web Panel</h1>
-            <div class="sub">Model: ${{ github.event.inputs.model }} · CPU inference</div>
-            <div id="log"></div>
-            <textarea id="q" placeholder="Ask something... (Ctrl+Enter to send)"></textarea>
-            <div class="row">
-              <button id="send" onclick="send()">Send</button>
-              <button onclick="clearLog()" style="background:#888">Clear</button>
-              <span class="status" id="status">Ready</span>
+            <header>
+              <div class="title">Ollama Console</div>
+              <div class="badge" id="statusBadge">Model: ${{ github.event.inputs.model }}</div>
+            </header>
+            
+            <div id="chat">
+              <div class="message ai">
+                <div class="avatar">AI</div>
+                <div class="content">Hello! I'm ready. What would you like to discuss?</div>
+              </div>
             </div>
-          <script>
-            // Since the proxy serves this page, we can use a same-origin relative URL.
-            const API_BASE = "";
-            const MODEL   = "${{ github.event.inputs.model }}";
+            
+            <div class="input-container">
+              <div class="input-box">
+                <textarea id="prompt" rows="1" placeholder="Message AI... (Shift+Enter for newline)"></textarea>
+                <div class="controls">
+                  <button class="btn-stop" id="btnStop" onclick="stopStream()">Stop</button>
+                  <button class="btn-send" id="btnSend" onclick="sendMessage()">Send</button>
+                </div>
+              </div>
+            </div>
 
-            const log = document.getElementById('log');
-            const qEl = document.getElementById('q');
-            const btn = document.getElementById('send');
-            const status = document.getElementById('status');
+            <script>
+              const MODEL = "${{ github.event.inputs.model }}";
+              let conversationHistory = [];
+              let currentController = null;
 
-            function append(text, cls) {
-              const div = document.createElement('div');
-              div.className = 'msg ' + (cls || '');
-              div.textContent = text;
-              log.appendChild(div);
-              log.scrollTop = log.scrollHeight;
-            }
-            function clearLog() { log.innerHTML = ''; }
+              // Configure marked.js for syntax highlighting
+              marked.setOptions({
+                highlight: function(code, lang) {
+                  if (lang && hljs.getLanguage(lang)) {
+                    return hljs.highlight(code, { language: lang }).value;
+                  }
+                  return hljs.highlightAuto(code).value;
+                },
+                breaks: true
+              });
 
-            async function send() {
-              const q = qEl.value.trim();
-              if (!q) return;
-              append('You: ' + q, 'user');
-              qEl.value = '';
-              btn.disabled = true;
-              status.textContent = 'Thinking...';
-              try {
-                // Call the same-origin proxy endpoint.
-                const r = await fetch(API_BASE + '/api/chat', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    model: MODEL,
-                    messages: [{ role: 'user', content: q }],
-                    stream: false
-                  })
-                });
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                const j = await r.json();
-                const reply = j.message?.content ?? j.choices?.[0]?.message?.content ?? '(empty response)';
-                append('AI: ' + reply, 'ai');
-                status.textContent = 'Ready';
-              } catch (e) {
-                append('Error: ' + e.message, 'err');
-                status.textContent = 'Error';
-              } finally {
-                btn.disabled = false;
-                qEl.focus();
+              const chatDiv = document.getElementById('chat');
+              const promptEl = document.getElementById('prompt');
+              const btnSend = document.getElementById('btnSend');
+              const btnStop = document.getElementById('btnStop');
+              const statusBadge = document.getElementById('statusBadge');
+
+              // Auto-resize textarea
+              promptEl.addEventListener('input', function() {
+                this.style.height = 'auto';
+                this.style.height = (this.scrollHeight) + 'px';
+              });
+
+              promptEl.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  sendMessage();
+                }
+              });
+
+              function createMessageBubble(role) {
+                const wrapper = document.createElement('div');
+                wrapper.className = `message ${role}`;
+                
+                const avatar = document.createElement('div');
+                avatar.className = 'avatar';
+                avatar.textContent = role === 'user' ? 'U' : 'AI';
+                
+                const content = document.createElement('div');
+                content.className = 'content';
+                
+                wrapper.appendChild(avatar);
+                wrapper.appendChild(content);
+                chatDiv.appendChild(wrapper);
+                return content;
               }
-            }
-            qEl.addEventListener('keydown', (e) => {
-              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send();
-            });
-            qEl.focus();
-          </script>
+
+              function stopStream() {
+                if (currentController) {
+                  currentController.abort();
+                  currentController = null;
+                  toggleButtons(false);
+                }
+              }
+
+              function toggleButtons(isStreaming) {
+                btnSend.style.display = isStreaming ? 'none' : 'block';
+                btnStop.style.display = isStreaming ? 'block' : 'none';
+                promptEl.disabled = isStreaming;
+                statusBadge.textContent = isStreaming ? 'Generating...' : `Model: ${MODEL}`;
+                if (!isStreaming) {
+                  promptEl.focus();
+                  promptEl.style.height = 'auto';
+                }
+              }
+
+              async function sendMessage() {
+                const text = promptEl.value.trim();
+                if (!text) return;
+
+                // 1. Add User message to UI & History
+                const userContentEl = createMessageBubble('user');
+                userContentEl.textContent = text;
+                conversationHistory.push({ role: 'user', content: text });
+                
+                promptEl.value = '';
+                toggleButtons(true);
+                chatDiv.scrollTop = chatDiv.scrollHeight;
+
+                // 2. Prepare AI response bubble
+                const aiContentEl = createMessageBubble('ai');
+                aiContentEl.innerHTML = '<span class="cursor"></span>';
+                
+                currentController = new AbortController();
+                let fullResponse = '';
+
+                try {
+                  const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    signal: currentController.signal,
+                    body: JSON.stringify({
+                      model: MODEL,
+                      messages: conversationHistory,
+                      stream: true
+                    })
+                  });
+
+                  if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+                  
+                  const reader = response.body.getReader();
+                  const decoder = new TextDecoder();
+                  
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value, { stream: true });
+                    const lines = chunk.split('\n').filter(l => l.trim() !== '');
+                    
+                    for (const line of lines) {
+                      try {
+                        const parsed = JSON.parse(line);
+                        if (parsed.message && parsed.message.content) {
+                          fullResponse += parsed.message.content;
+                          // Render Markdown live safely
+                          aiContentEl.innerHTML = DOMPurify.sanitize(marked.parse(fullResponse)) + '<span class="cursor"></span>';
+                          
+                          // Only auto-scroll if user is near bottom
+                          if (chatDiv.scrollHeight - chatDiv.scrollTop < chatDiv.clientHeight + 100) {
+                            chatDiv.scrollTop = chatDiv.scrollHeight;
+                          }
+                        }
+                      } catch (e) { console.error("Parse error chunk:", line); }
+                    }
+                  }
+                  
+                  // Save to history on completion
+                  conversationHistory.push({ role: 'assistant', content: fullResponse });
+                  
+                } catch (err) {
+                  if (err.name !== 'AbortError') {
+                    aiContentEl.innerHTML += `<br><span style="color:red">[Error: ${err.message}]</span>`;
+                  }
+                } finally {
+                  // Remove cursor on finish
+                  const cursor = aiContentEl.querySelector('.cursor');
+                  if (cursor) cursor.remove();
+                  toggleButtons(false);
+                }
+              }
+            </script>
           </body>
           </html>
           EOF
 
-          echo "Proxy server and web panel created."
-          ls -lh web/
-
-      - name: Start proxy server
+      - name: Setup Caddy Reverse Proxy
         run: |
-          cd web
-          python3 server.py > ../proxy.log 2>&1 &
+          # Use Caddy for a secure, zero-config, high-performance streaming proxy
+          wget -qO caddy "https://caddyserver.com/api/download?os=linux&arch=amd64"
+          chmod +x caddy
+          
+          cat > Caddyfile << 'EOF'
+          :3000 {
+            handle /api/* {
+              reverse_proxy 127.0.0.1:11434
+            }
+            handle {
+              root * web
+              file_server
+            }
+          }
+          EOF
+          
+          ./caddy run --config Caddyfile > caddy.log 2>&1 &
+          
+          # Health check Caddy
           sleep 2
-          curl -s http://localhost:3000/ > /dev/null && echo "Proxy server is running on port 3000."
+          curl -s http://127.0.0.1:3000/ > /dev/null && echo "Caddy web server running."
 
-      - name: Install cloudflared and start tunnel
+      - name: Start Cloudflare Tunnel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
           chmod +x cloudflared
 
-          # ONE tunnel for everything (panel + API).
-          ./cloudflared tunnel --url http://localhost:3000 \
-            --http-host-header localhost:3000 \
+          ./cloudflared tunnel --url http://127.0.0.1:3000 \
             --no-autoupdate > cf.log 2>&1 &
 
           echo "Waiting for Cloudflare tunnel URL..."
           PUBLIC_URL=""
-          for i in {1..40}; do
-            PUBLIC_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf.log 2>/dev/null | head -n 1)
+          for i in {1..20}; do
+            PUBLIC_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf.log | head -n 1)
             if [ -n "$PUBLIC_URL" ]; then break; fi
             sleep 2
           done
 
           if [ -z "$PUBLIC_URL" ]; then
-            echo "Failed to get URL."
+            echo "Failed to get Cloudflare URL."
             cat cf.log
             exit 1
           fi
@@ -274,18 +325,20 @@ jobs:
           echo "PUBLIC_URL=$PUBLIC_URL" >> $GITHUB_ENV
 
           {
-            echo "### 🚀 Ollama Web Panel is live!"
+            echo "### 🚀 Ollama Web Panel is Live!"
             echo ""
-            echo "**Access URL:** $PUBLIC_URL"
+            echo "🔗 **Access URL:** [$PUBLIC_URL]($PUBLIC_URL)"
             echo ""
-            echo "This single URL serves both the chat UI and the API proxy."
-            echo "No CORS issues, no separate API endpoint needed."
+            echo "**Features Added in this Build:**"
+            echo "- 💬 **Conversation Memory:** The AI now remembers your previous messages."
+            echo "- 📝 **Markdown & Code:** Full syntax highlighting and table support."
+            echo "- ⚡ **Caddy Server:** Replaced the Python proxy for vastly superior streaming reliability."
             echo ""
-            echo "Links expire when the job stops (max 6 hours)."
+            echo "*Note: The link expires when the job finishes (max 6 hours).*"
           } >> $GITHUB_STEP_SUMMARY
 
       - name: Keep job alive (6 hours)
         run: |
-          echo "Web panel: ${{ env.PUBLIC_URL }}"
-          echo "Job will run for 6 hours. Cancel to stop early."
+          echo "Web panel active at: ${{ env.PUBLIC_URL }}"
+          echo "Sleeping for 6 hours... Cancel the GitHub Action to shut down early."
           sleep 21600
