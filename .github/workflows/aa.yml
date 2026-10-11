@@ -1,0 +1,268 @@
+name: AI Web Panel via TryCloudflare (All-in-One)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-ai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # Max 6 hours
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl unzip python3
+
+      - name: Download latest llama.cpp prebuilt binaries
+        run: |
+          TAG=$(curl -s https://api.github.com/repos/ggerganov/llama.cpp/releases/latest \
+                | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Using llama.cpp release: $TAG"
+          wget -q "https://github.com/ggerganov/llama.cpp/releases/download/${TAG}/llama-${TAG}-bin-ubuntu-x64.zip" -O llama.zip
+          unzip -o llama.zip -d llama
+          LLAMA_SERVER=$(find llama -name llama-server -type f | head -n 1)
+          chmod +x "$LLAMA_SERVER"
+          echo "LLAMA_SERVER=$LLAMA_SERVER" >> $GITHUB_ENV
+
+      - name: Download model (Qwen2.5-7B-Instruct Q4_K_M)
+        run: |
+          mkdir -p models
+          # ~4.7 GB download, fits comfortably in 16 GB RAM
+          wget -q https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf -O models/model.gguf
+          ls -lh models/
+
+      - name: Create custom web panel (index.html)
+        run: |
+          mkdir -p web
+          cat > web/index.html << 'EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Local LLM Panel</title>
+            <style>
+              * { box-sizing: border-box; }
+              body {
+                font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+                max-width: 860px;
+                margin: 2rem auto;
+                padding: 0 1rem;
+                background: #f5f5f5;
+                color: #222;
+              }
+              h1 { font-size: 1.4rem; margin-bottom: .25rem; }
+              .sub { color: #666; font-size: .85rem; margin-bottom: 1rem; }
+              #log {
+                background: #fff;
+                border: 1px solid #ddd;
+                border-radius: 10px;
+                padding: 1rem;
+                min-height: 380px;
+                max-height: 60vh;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                line-height: 1.5;
+                font-size: .95rem;
+              }
+              .msg { margin-bottom: .8rem; }
+              .msg.user { color: #0b5; }
+              .msg.ai { color: #222; }
+              .msg.err { color: #b00; }
+              textarea {
+                width: 100%;
+                height: 70px;
+                margin-top: .75rem;
+                padding: .6rem;
+                border: 1px solid #ccc;
+                border-radius: 8px;
+                font-family: inherit;
+                font-size: .95rem;
+                resize: vertical;
+              }
+              .row { display: flex; gap: .5rem; margin-top: .5rem; }
+              button {
+                padding: .55rem 1.2rem;
+                border: 0;
+                border-radius: 8px;
+                background: #222;
+                color: #fff;
+                font-size: .95rem;
+                cursor: pointer;
+              }
+              button:disabled { opacity: .5; cursor: not-allowed; }
+              .status { font-size: .8rem; color: #888; margin-left: auto; align-self: center; }
+            </style>
+          </head>
+          <body>
+            <h1>Local LLM Web Panel</h1>
+            <div class="sub">Powered by llama.cpp &middot; CPU inference</div>
+            <div id="log"></div>
+            <textarea id="q" placeholder="Ask something... (Ctrl+Enter to send)"></textarea>
+            <div class="row">
+              <button id="send" onclick="send()">Send</button>
+              <button onclick="clearLog()" style="background:#888">Clear</button>
+              <span class="status" id="status">Ready</span>
+            </div>
+
+          <script>
+            // Replace this with your actual API tunnel URL after the workflow runs.
+            // The workflow will print both URLs in the job summary.
+            const API_BASE = "__API_BASE_URL__";
+
+            const log = document.getElementById('log');
+            const qEl = document.getElementById('q');
+            const btn = document.getElementById('send');
+            const status = document.getElementById('status');
+
+            function append(text, cls) {
+              const div = document.createElement('div');
+              div.className = 'msg ' + (cls || '');
+              div.textContent = text;
+              log.appendChild(div);
+              log.scrollTop = log.scrollHeight;
+            }
+            function clearLog() { log.innerHTML = ''; }
+
+            async function send() {
+              const q = qEl.value.trim();
+              if (!q) return;
+              if (!API_BASE || API_BASE.includes('__')) {
+                append('API URL is not set. Copy the API tunnel URL from the workflow summary and paste it into API_BASE in index.html.', 'err');
+                return;
+              }
+              append('You: ' + q, 'user');
+              qEl.value = '';
+              btn.disabled = true;
+              status.textContent = 'Thinking...';
+              try {
+                const r = await fetch(API_BASE + '/v1/chat/completions', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    model: 'local',
+                    messages: [{ role: 'user', content: q }],
+                    stream: false
+                  })
+                });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const j = await r.json();
+                const reply = j.choices?.[0]?.message?.content ?? '(empty response)';
+                append('AI: ' + reply, 'ai');
+                status.textContent = 'Ready';
+              } catch (e) {
+                append('Error: ' + e.message, 'err');
+                status.textContent = 'Error';
+              } finally {
+                btn.disabled = false;
+                qEl.focus();
+              }
+            }
+
+            qEl.addEventListener('keydown', (e) => {
+              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send();
+            });
+            qEl.focus();
+          </script>
+          </body>
+          </html>
+          EOF
+          echo "Web panel created at web/index.html"
+          ls -lh web/
+
+      - name: Start llama.cpp server
+        run: |
+          ${{ env.LLAMA_SERVER }} -m models/model.gguf \
+            --host 0.0.0.0 --port 8080 \
+            --ctx-size 4096 --threads 4 > llama.log 2>&1 &
+          echo "Waiting for llama-server to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/health > /dev/null 2>&1; then
+              echo "llama-server is ready."
+              break
+            fi
+            sleep 2
+          done
+          curl -s http://localhost:8080/health || echo "health check failed"
+
+      - name: Start static web panel server
+        run: |
+          cd web
+          python3 -m http.server 3000 > ../web.log 2>&1 &
+          sleep 2
+          curl -s http://localhost:3000/ > /dev/null && echo "Web panel server is running on port 3000."
+
+      - name: Install cloudflared and start both tunnels
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+          # Tunnel 1: custom web panel on port 3000
+          ./cloudflared tunnel --url http://localhost:3000 --no-autoupdate > cf-web.log 2>&1 &
+          # Tunnel 2: llama.cpp API on port 8080
+          ./cloudflared tunnel --url http://localhost:8080 --no-autoupdate > cf-api.log 2>&1 &
+
+          echo "Waiting for both Cloudflare tunnel URLs..."
+          WEB_URL=""
+          API_URL=""
+          for i in {1..40}; do
+            WEB_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf-web.log 2>/dev/null | head -n 1)
+            API_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf-api.log 2>/dev/null | head -n 1)
+            if [ -n "$WEB_URL" ] && [ -n "$API_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$WEB_URL" ] || [ -z "$API_URL" ]; then
+            echo "Failed to get one or both URLs."
+            echo "--- cf-web.log ---"; cat cf-web.log
+            echo "--- cf-api.log ---"; cat cf-api.log
+            exit 1
+          fi
+
+          echo "WEB_PANEL_URL=$WEB_URL" >> $GITHUB_ENV
+          echo "API_URL=$API_URL" >> $GITHUB_ENV
+
+          {
+            echo "### 🚀 AI Web Panel is live!"
+            echo ""
+            echo "**Web panel (custom UI):** $WEB_URL"
+            echo ""
+            echo "**API endpoint:** $API_URL"
+            echo ""
+            echo "---"
+            echo ""
+            echo "⚠️ **Important:** The web panel's \`API_BASE\` is currently set to a placeholder."
+            echo "To make the panel work, you must do one of the following:"
+            echo ""
+            echo "1. **Edit the web panel after tunnel is up** (easiest for testing):"
+            echo "   - The workflow will patch the placeholder below if you enable the optional step."
+            echo "2. **Or manually update** \`API_BASE\` in \`web/index.html\` with the API URL above and re-run."
+            echo ""
+            echo "Links expire when the job stops (max 6 hours)."
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Patch web panel with the API URL (optional)
+        run: |
+          # Replace the placeholder in the served HTML with the real API tunnel URL.
+          # Note: this patches the file on disk, but the Python server may have already cached it.
+          # For a live patch, restart the web server after patching.
+          sed -i "s|__API_BASE_URL__|${{ env.API_URL }}|g" web/index.html
+          # Restart the static server so it serves the updated file.
+          pkill -f "http.server 3000" || true
+          cd web
+          python3 -m http.server 3000 > ../web.log 2>&1 &
+          sleep 2
+          echo "Web panel patched with API URL: ${{ env.API_URL }}"
+          echo "If the page was already loaded, do a hard refresh (Ctrl+Shift+R)."
+
+      - name: Keep job alive (6 hours)
+        run: |
+          echo "Web panel: ${{ env.WEB_PANEL_URL }}"
+          echo "API:       ${{ env.API_URL }}"
+          echo "Job will run for 6 hours. Cancel to stop early."
+          sleep 21600
