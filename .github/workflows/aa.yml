@@ -1,4 +1,4 @@
-name: Ollama AI Web Panel via TryCloudflare (Fixed CORS + 403)
+name: Ollama Web Panel via TryCloudflare (Same-Origin)
 
 on:
   workflow_dispatch:
@@ -30,8 +30,8 @@ jobs:
 
       - name: Start Ollama server with CORS enabled
         run: |
-          # Allow all origins so the web panel's tunnel URL can reach the API.
-          # For tighter security, replace '*' with your specific trycloudflare panel URL.
+          # Allow all origins. Since the browser will now talk to the proxy (same origin),
+          # this is less critical, but it helps if you ever test directly.
           export OLLAMA_ORIGINS='*'
           export OLLAMA_HOST='0.0.0.0:11434'
           ollama serve > ollama.log 2>&1 &
@@ -52,9 +52,82 @@ jobs:
           echo "Model pulled."
           ollama list
 
-      - name: Create custom web panel (index.html)
+      - name: Create same-origin proxy server and web panel
         run: |
           mkdir -p web
+          # The proxy server serves the HTML and forwards /api/* calls to Ollama.
+          cat > web/server.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Simple same-origin proxy server.
+          - Serves the chat UI at /
+          - Forwards /api/* and /v1/* requests to the local Ollama instance.
+          """
+          import http.server
+          import socketserver
+          import urllib.request
+          import urllib.error
+          import json
+          import os
+
+          OLLAMA_BASE = "http://localhost:11434"
+
+          class ProxyHandler(http.server.SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path.startswith("/api/") or self.path.startswith("/v1/"):
+                      self.proxy_request()
+                  else:
+                      # Serve static files (index.html)
+                      super().do_GET()
+
+              def do_POST(self):
+                  if self.path.startswith("/api/") or self.path.startswith("/v1/"):
+                      self.proxy_request()
+                  else:
+                      self.send_error(405, "Method Not Allowed")
+
+              def proxy_request(self):
+                  target_url = OLLAMA_BASE + self.path
+                  content_length = int(self.headers.get("Content-Length", 0))
+                  body = self.rfile.read(content_length) if content_length > 0 else None
+
+                  req = urllib.request.Request(
+                      target_url,
+                      data=body,
+                      method=self.command,
+                      headers={
+                          "Content-Type": self.headers.get("Content-Type", "application/json"),
+                          "Host": "localhost:11434",
+                      }
+                  )
+
+                  try:
+                      with urllib.request.urlopen(req) as resp:
+                          self.send_response(resp.status)
+                          for k, v in resp.headers.items():
+                              if k.lower() not in ["transfer-encoding", "connection"]:
+                                  self.send_header(k, v)
+                          self.end_headers()
+                          self.wfile.write(resp.read())
+                  except urllib.error.HTTPError as e:
+                      self.send_response(e.code)
+                      self.end_headers()
+                      self.wfile.write(e.read())
+                  except Exception as e:
+                      self.send_error(502, f"Proxy error: {e}")
+
+              def log_message(self, format, *args):
+                  # Quieter logging
+                  pass
+
+          PORT = 3000
+          os.chdir(os.path.dirname(os.path.abspath(__file__)))
+          with socketserver.ThreadingTCPServer(("", PORT), ProxyHandler) as httpd:
+              print(f"Proxy server running on port {PORT}")
+              httpd.serve_forever()
+          PYEOF
+
+          # Create the web panel HTML (it talks to /api/chat on the same origin).
           cat > web/index.html << 'EOF'
           <!doctype html>
           <html lang="en">
@@ -106,8 +179,8 @@ jobs:
               <span class="status" id="status">Ready</span>
             </div>
           <script>
-            // The workflow will patch this with the real API tunnel URL.
-            const API_BASE = "__API_BASE_URL__";
+            // Since the proxy serves this page, we can use a same-origin relative URL.
+            const API_BASE = "";
             const MODEL   = "${{ github.event.inputs.model }}";
 
             const log = document.getElementById('log');
@@ -127,25 +200,15 @@ jobs:
             async function send() {
               const q = qEl.value.trim();
               if (!q) return;
-              if (!API_BASE || API_BASE.includes('__')) {
-                append('API URL is not set. Copy the API tunnel URL from the workflow summary and paste it into API_BASE in index.html.', 'err');
-                return;
-              }
               append('You: ' + q, 'user');
               qEl.value = '';
               btn.disabled = true;
               status.textContent = 'Thinking...';
               try {
-                const r = await fetch(API_BASE + '/v1/chat/completions', {
+                // Call the same-origin proxy endpoint.
+                const r = await fetch(API_BASE + '/api/chat', {
                   method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    // Explicitly request CORS permission from the browser.
-                    'Accept': 'application/json'
-                  },
-                  // Include credentials is not needed here, but some browsers
-                  // require the mode to be set for cross-origin requests.
-                  mode: 'cors',
+                  headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     model: MODEL,
                     messages: [{ role: 'user', content: q }],
@@ -154,7 +217,7 @@ jobs:
                 });
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 const j = await r.json();
-                const reply = j.choices?.[0]?.message?.content ?? '(empty response)';
+                const reply = j.message?.content ?? j.choices?.[0]?.message?.content ?? '(empty response)';
                 append('AI: ' + reply, 'ai');
                 status.textContent = 'Ready';
               } catch (e) {
@@ -173,82 +236,56 @@ jobs:
           </body>
           </html>
           EOF
-          echo "Web panel created at web/index.html"
+
+          echo "Proxy server and web panel created."
           ls -lh web/
 
-      - name: Start static web panel server
+      - name: Start proxy server
         run: |
           cd web
-          python3 -m http.server 3000 > ../web.log 2>&1 &
+          python3 server.py > ../proxy.log 2>&1 &
           sleep 2
-          curl -s http://localhost:3000/ > /dev/null && echo "Web panel server is running on port 3000."
+          curl -s http://localhost:3000/ > /dev/null && echo "Proxy server is running on port 3000."
 
-      - name: Install cloudflared and start both tunnels
+      - name: Install cloudflared and start tunnel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
           chmod +x cloudflared
 
-          # Tunnel 1: custom web panel on port 3000
-          # --http-host-header tells Cloudflare to forward the correct Host header,
-          # avoiding 403 errors from Bot Fight Mode / WAF.
+          # ONE tunnel for everything (panel + API).
           ./cloudflared tunnel --url http://localhost:3000 \
             --http-host-header localhost:3000 \
-            --no-autoupdate > cf-web.log 2>&1 &
+            --no-autoupdate > cf.log 2>&1 &
 
-          # Tunnel 2: Ollama API on port 11434
-          # Same --http-host-header fix for the API tunnel.
-          ./cloudflared tunnel --url http://localhost:11434 \
-            --http-host-header localhost:11434 \
-            --no-autoupdate > cf-api.log 2>&1 &
-
-          echo "Waiting for both Cloudflare tunnel URLs..."
-          WEB_URL=""; API_URL=""
+          echo "Waiting for Cloudflare tunnel URL..."
+          PUBLIC_URL=""
           for i in {1..40}; do
-            WEB_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf-web.log 2>/dev/null | head -n 1)
-            API_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf-api.log 2>/dev/null | head -n 1)
-            if [ -n "$WEB_URL" ] && [ -n "$API_URL" ]; then break; fi
+            PUBLIC_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf.log 2>/dev/null | head -n 1)
+            if [ -n "$PUBLIC_URL" ]; then break; fi
             sleep 2
           done
 
-          if [ -z "$WEB_URL" ] || [ -z "$API_URL" ]; then
-            echo "Failed to get one or both URLs."
-            echo "--- cf-web.log ---"; cat cf-web.log
-            echo "--- cf-api.log ---"; cat cf-api.log
+          if [ -z "$PUBLIC_URL" ]; then
+            echo "Failed to get URL."
+            cat cf.log
             exit 1
           fi
 
-          echo "WEB_PANEL_URL=$WEB_URL" >> $GITHUB_ENV
-          echo "API_URL=$API_URL" >> $GITHUB_ENV
+          echo "PUBLIC_URL=$PUBLIC_URL" >> $GITHUB_ENV
 
           {
             echo "### 🚀 Ollama Web Panel is live!"
             echo ""
-            echo "**Web panel (custom UI):** $WEB_URL"
+            echo "**Access URL:** $PUBLIC_URL"
             echo ""
-            echo "**API endpoint:** $API_URL"
-            echo ""
-            echo "---"
-            echo ""
-            echo "⚠️ **CORS is enabled with OLLAMA_ORIGINS=*.**"
-            echo "The web panel is automatically patched with the API URL below."
-            echo "If the page was already loaded, do a hard refresh (Ctrl+Shift+R)."
+            echo "This single URL serves both the chat UI and the API proxy."
+            echo "No CORS issues, no separate API endpoint needed."
             echo ""
             echo "Links expire when the job stops (max 6 hours)."
           } >> $GITHUB_STEP_SUMMARY
 
-      - name: Patch web panel with the API URL
-        run: |
-          sed -i "s|__API_BASE_URL__|${{ env.API_URL }}|g" web/index.html
-          pkill -f "http.server 3000" || true
-          cd web
-          python3 -m http.server 3000 > ../web.log 2>&1 &
-          sleep 2
-          echo "Web panel patched with API URL: ${{ env.API_URL }}"
-          echo "If the page was already loaded, do a hard refresh (Ctrl+Shift+R)."
-
       - name: Keep job alive (6 hours)
         run: |
-          echo "Web panel: ${{ env.WEB_PANEL_URL }}"
-          echo "API:       ${{ env.API_URL }}"
+          echo "Web panel: ${{ env.PUBLIC_URL }}"
           echo "Job will run for 6 hours. Cancel to stop early."
           sleep 21600
