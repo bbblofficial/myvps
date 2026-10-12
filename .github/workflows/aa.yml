@@ -28,7 +28,6 @@ jobs:
           sudo pkill -9 -f 'ollama' 2>/dev/null || true
           sudo fuser -k 11434/tcp 2>/dev/null || true
           sleep 3
-          # Persist env in case anything ever restarts the service
           sudo mkdir -p /etc/systemd/system/ollama.service.d
           sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'SYSEOF'
           [Service]
@@ -36,7 +35,6 @@ jobs:
           Environment="OLLAMA_HOST=127.0.0.1:11434"
           SYSEOF
           sudo systemctl daemon-reload
-          # ---- Start Ollama ourselves with the env we need ----
           export OLLAMA_ORIGINS='*'
           export OLLAMA_HOST='127.0.0.1:11434'
           nohup ollama serve > ollama.log 2>&1 &
@@ -51,12 +49,10 @@ jobs:
           done
           echo "--- OLLAMA_* env of pid $OLLAMA_PID ---"
           tr '\0' '\n' < /proc/$OLLAMA_PID/environ | grep -E '^OLLAMA_' || echo "(unreadable)"
-          # ---- Smoke test: GET with a tunnel-like Origin ----
           CODE=$(curl -s -o /dev/null -w '%{http_code}' \
             -H 'Origin: https://foo.trycloudflare.com' \
             http://127.0.0.1:11434/api/tags)
           echo "Origin smoke test (GET /api/tags) -> HTTP $CODE"
-          # ---- Smoke test: POST /api/chat (404 = origin OK, 403 = origin blocked) ----
           CODE2=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Origin: https://foo.trycloudflare.com' \
             -H 'Content-Type: application/json' \
@@ -299,7 +295,6 @@ jobs:
             cat caddy.log
             exit 1
           fi
-          # Sanity check through Caddy (404 = origin ok, 403 = origin blocked)
           CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Origin: https://foo.trycloudflare.com' \
             -H 'Content-Type: application/json' \
@@ -313,14 +308,10 @@ jobs:
           fi
 
       # =====================================================================
-      # FIX: Cloudflare Tunnel step
-      # ---------------------------------------------------------------------
-      # The URL-grep loop was dying on the first iteration because GitHub
-      # Actions runs bash with `-e -o pipefail`, and `grep` exits 1 when
-      # there is no match yet. The pipeline therefore returned 1, which
-      # `set -e` treated as a fatal error before the `if` even ran.
-      # Fix: swallow grep's exit code with `|| true`, silence grep's
-      # stderr, and add a liveness check on the cloudflared process.
+      # FIX: exit code 6 was curl's CURLE_COULDNT_RESOLVE_HOST on the freshly
+      # published *.trycloudflare.com hostname. DNS for the new subdomain
+      # takes a few seconds to propagate. We now retry the probe, tolerate
+      # curl failures, and treat the probe as informational only.
       # =====================================================================
       - name: Start Cloudflare Tunnel
         run: |
@@ -333,7 +324,6 @@ jobs:
           echo "Waiting for Cloudflare tunnel URL..."
           PUBLIC_URL=""
           for i in {1..30}; do
-            # `|| true` is essential: with pipefail, a no-match grep aborts the script.
             PUBLIC_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf.log 2>/dev/null | head -n 1 || true)
             if [ -n "$PUBLIC_URL" ]; then
               echo "Got URL: $PUBLIC_URL"
@@ -355,12 +345,23 @@ jobs:
 
           echo "PUBLIC_URL=$PUBLIC_URL" >> $GITHUB_ENV
 
-          # End-to-end test against the public tunnel URL
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-            -H 'Content-Type: application/json' \
-            -d '{"model":"__probe__","messages":[{"role":"user","content":"x"}],"stream":false}' \
-            "$PUBLIC_URL/api/chat")
-          echo "Public tunnel POST /api/chat -> HTTP $CODE"
+          # ---- End-to-end test against the public tunnel URL ----
+          # Retry because DNS for a brand-new trycloudflare subdomain
+          # is not instantly resolvable (curl exit 6 = couldn't resolve host).
+          # Non-fatal: it's a diagnostic, not a gate.
+          CODE="000"
+          for i in {1..10}; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H 'Content-Type: application/json' \
+              -d '{"model":"__probe__","messages":[{"role":"user","content":"x"}],"stream":false}' \
+              "$PUBLIC_URL/api/chat" || true)
+            echo "Attempt $i: HTTP $CODE"
+            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
+              break
+            fi
+            sleep 3
+          done
+          echo "Public tunnel POST /api/chat -> HTTP $CODE (404 = OK, 403 = origin blocked, 000 = DNS not ready yet)"
 
           {
             echo "### 🚀 Ollama Web Panel is Live!"
@@ -368,7 +369,10 @@ jobs:
             echo "🔗 **Access URL:** [$PUBLIC_URL]($PUBLIC_URL)"
             echo ""
             echo "**Diagnostics**"
-            echo "- Public tunnel POST /api/chat: HTTP $CODE (404 = OK, 403 = origin blocked)"
+            echo "- Public tunnel POST /api/chat: HTTP \`$CODE\`"
+            echo "  - \`404\` = OK (origin accepted, model just doesn't exist)"
+            echo "  - \`403\` = origin blocked (should not happen with current build)"
+            echo "  - \`000\` = runner couldn't resolve DNS yet; the URL still works from your browser"
             echo ""
             echo "*Note: The link expires when the job finishes (max 6 hours).*"
           } >> $GITHUB_STEP_SUMMARY
