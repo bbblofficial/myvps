@@ -22,14 +22,12 @@ jobs:
       - name: Install & Start Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
-
-          # ---- FIX: nuke the installer's systemd service (it lacks our env) ----
+          # ---- FIX 1: nuke the installer's systemd service (it lacks our env) ----
           sudo systemctl stop ollama 2>/dev/null || true
           sudo systemctl disable ollama 2>/dev/null || true
           sudo pkill -9 -f 'ollama' 2>/dev/null || true
           sudo fuser -k 11434/tcp 2>/dev/null || true
           sleep 3
-
           # Persist env in case anything ever restarts the service
           sudo mkdir -p /etc/systemd/system/ollama.service.d
           sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'SYSEOF'
@@ -38,13 +36,11 @@ jobs:
           Environment="OLLAMA_HOST=127.0.0.1:11434"
           SYSEOF
           sudo systemctl daemon-reload
-
           # ---- Start Ollama ourselves with the env we need ----
           export OLLAMA_ORIGINS='*'
           export OLLAMA_HOST='127.0.0.1:11434'
           nohup ollama serve > ollama.log 2>&1 &
           OLLAMA_PID=$!
-
           echo "Waiting for Ollama to start..."
           for i in {1..30}; do
             if curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
@@ -53,24 +49,20 @@ jobs:
             fi
             sleep 2
           done
-
           echo "--- OLLAMA_* env of pid $OLLAMA_PID ---"
           tr '\0' '\n' < /proc/$OLLAMA_PID/environ | grep -E '^OLLAMA_' || echo "(unreadable)"
-
           # ---- Smoke test: GET with a tunnel-like Origin ----
           CODE=$(curl -s -o /dev/null -w '%{http_code}' \
             -H 'Origin: https://foo.trycloudflare.com' \
             http://127.0.0.1:11434/api/tags)
           echo "Origin smoke test (GET /api/tags) -> HTTP $CODE"
-
-          # ---- Smoke test: POST /api/chat (exactly what the browser does) ----
+          # ---- Smoke test: POST /api/chat (404 = origin OK, 403 = origin blocked) ----
           CODE2=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Origin: https://foo.trycloudflare.com' \
             -H 'Content-Type: application/json' \
             -d '{"model":"__probe__","messages":[{"role":"user","content":"x"}],"stream":false}' \
             http://127.0.0.1:11434/api/chat)
           echo "Origin smoke test (POST /api/chat) -> HTTP $CODE2"
-
           if [ "$CODE" = "403" ] || [ "$CODE2" = "403" ]; then
             echo "::error::Ollama origin check rejecting tunnel origins"
             cat ollama.log
@@ -93,21 +85,17 @@ jobs:
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <title>Ollama Web UI</title>
-            <!-- Markdown, Purify, and Syntax Highlighting -->
             <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
             <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
             <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
             <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-
             <style>
               :root { --bg: #f9fafb; --chat-bg: #ffffff; --primary: #10b981; --text: #1f2937; --border: #e5e7eb; }
               * { box-sizing: border-box; margin: 0; padding: 0; }
               body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
-
               header { background: var(--chat-bg); padding: 1rem 2rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
               .title { font-weight: 600; font-size: 1.25rem; }
               .badge { background: #ecfdf5; color: #047857; padding: 0.25rem 0.75rem; border-radius: 999px; font-size: 0.875rem; font-weight: 500; }
-
               #chat { flex: 1; overflow-y: auto; padding: 2rem; display: flex; flex-direction: column; gap: 1.5rem; scroll-behavior: smooth; }
               .message { max-width: 800px; margin: 0 auto; width: 100%; display: flex; gap: 1rem; line-height: 1.6; }
               .message.user { flex-direction: row-reverse; }
@@ -116,7 +104,6 @@ jobs:
               .ai .avatar { background: #374151; color: white; }
               .content { padding: 0.75rem 1.25rem; border-radius: 12px; background: var(--chat-bg); border: 1px solid var(--border); overflow-x: auto; width: 100%; }
               .user .content { background: #ecfdf5; border-color: #d1fae5; }
-
               .content pre { background: #1f2937; color: #f8f8f2; padding: 1rem; border-radius: 8px; overflow-x: auto; margin: 0.75rem 0; }
               .content code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.9em; padding: 0.2em 0.4em; border-radius: 4px; background: rgba(0,0,0,0.05); }
               .content pre code { padding: 0; background: transparent; }
@@ -124,7 +111,6 @@ jobs:
               .content p:last-child { margin-bottom: 0; }
               .content table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
               .content th, .content td { border: 1px solid var(--border); padding: 0.5rem; text-align: left; }
-
               .input-container { background: var(--chat-bg); padding: 1.5rem 2rem; border-top: 1px solid var(--border); display: flex; justify-content: center; }
               .input-box { max-width: 800px; width: 100%; display: flex; gap: 1rem; background: var(--bg); padding: 0.75rem; border-radius: 12px; border: 1px solid var(--border); align-items: flex-end; }
               textarea { flex: 1; border: none; background: transparent; resize: none; max-height: 200px; font-family: inherit; font-size: 1rem; padding: 0.25rem; outline: none; }
@@ -133,7 +119,6 @@ jobs:
               button:disabled { opacity: 0.5; cursor: not-allowed; }
               .btn-send { background: var(--primary); color: white; }
               .btn-stop { background: #ef4444; color: white; display: none; }
-
               .cursor { display: inline-block; width: 8px; height: 1em; background: currentColor; animation: blink 1s step-end infinite; vertical-align: middle; margin-left: 2px; }
               @keyframes blink { 50% { opacity: 0; } }
             </style>
@@ -143,14 +128,12 @@ jobs:
               <div class="title">Ollama Console</div>
               <div class="badge" id="statusBadge">Model: ${{ github.event.inputs.model }}</div>
             </header>
-
             <div id="chat">
               <div class="message ai">
                 <div class="avatar">AI</div>
                 <div class="content">Hello! I'm ready. What would you like to discuss?</div>
               </div>
             </div>
-
             <div class="input-container">
               <div class="input-box">
                 <textarea id="prompt" rows="1" placeholder="Message AI... (Shift+Enter for newline)"></textarea>
@@ -160,12 +143,10 @@ jobs:
                 </div>
               </div>
             </div>
-
             <script>
               const MODEL = "${{ github.event.inputs.model }}";
               let conversationHistory = [];
               let currentController = null;
-
               marked.setOptions({
                 highlight: function(code, lang) {
                   if (lang && hljs.getLanguage(lang)) {
@@ -175,13 +156,11 @@ jobs:
                 },
                 breaks: true
               });
-
               const chatDiv = document.getElementById('chat');
               const promptEl = document.getElementById('prompt');
               const btnSend = document.getElementById('btnSend');
               const btnStop = document.getElementById('btnStop');
               const statusBadge = document.getElementById('statusBadge');
-
               promptEl.addEventListener('input', function() {
                 this.style.height = 'auto';
                 this.style.height = (this.scrollHeight) + 'px';
@@ -192,7 +171,6 @@ jobs:
                   sendMessage();
                 }
               });
-
               function createMessageBubble(role) {
                 const wrapper = document.createElement('div');
                 wrapper.className = `message ${role}`;
@@ -206,7 +184,6 @@ jobs:
                 chatDiv.appendChild(wrapper);
                 return content;
               }
-
               function stopStream() {
                 if (currentController) {
                   currentController.abort();
@@ -214,7 +191,6 @@ jobs:
                   toggleButtons(false);
                 }
               }
-
               function toggleButtons(isStreaming) {
                 btnSend.style.display = isStreaming ? 'none' : 'block';
                 btnStop.style.display = isStreaming ? 'block' : 'none';
@@ -225,25 +201,19 @@ jobs:
                   promptEl.style.height = 'auto';
                 }
               }
-
               async function sendMessage() {
                 const text = promptEl.value.trim();
                 if (!text) return;
-
                 const userContentEl = createMessageBubble('user');
                 userContentEl.textContent = text;
                 conversationHistory.push({ role: 'user', content: text });
-
                 promptEl.value = '';
                 toggleButtons(true);
                 chatDiv.scrollTop = chatDiv.scrollHeight;
-
                 const aiContentEl = createMessageBubble('ai');
                 aiContentEl.innerHTML = '<span class="cursor"></span>';
-
                 currentController = new AbortController();
                 let fullResponse = '';
-
                 try {
                   const response = await fetch('/api/chat', {
                     method: 'POST',
@@ -255,24 +225,18 @@ jobs:
                       stream: true
                     })
                   });
-
-                  // ---- FIX: surface the response body on failure ----
                   if (!response.ok) {
                     let body = '';
                     try { body = await response.text(); } catch (_) {}
                     throw new Error(`HTTP ${response.status} ${response.statusText} — ${body.slice(0, 300)}`);
                   }
-
                   const reader = response.body.getReader();
                   const decoder = new TextDecoder();
-
                   while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
-
                     const chunk = decoder.decode(value, { stream: true });
                     const lines = chunk.split('\n').filter(l => l.trim() !== '');
-
                     for (const line of lines) {
                       try {
                         const parsed = JSON.parse(line);
@@ -286,9 +250,7 @@ jobs:
                       } catch (e) { console.error("Parse error chunk:", line); }
                     }
                   }
-
                   conversationHistory.push({ role: 'assistant', content: fullResponse });
-
                 } catch (err) {
                   if (err.name !== 'AbortError') {
                     aiContentEl.innerHTML += `<br><span style="color:red">[Error: ${err.message}]</span>`;
@@ -309,20 +271,12 @@ jobs:
           wget -qO caddy.tar.gz "https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz"
           tar -xzf caddy.tar.gz caddy
           chmod +x caddy
-
           cat > Caddyfile << 'EOF'
           :3000 {
             handle /api/* {
               reverse_proxy 127.0.0.1:11434 {
-                # ---- FIX 2 -------------------------------------------------
-                # Ollama returns 403 for any Origin it doesn't recognise.
-                # Browsers send Origin even on same-origin POSTs, and the
-                # trycloudflare domain is random. Rewriting the Origin to
-                # a value Ollama always allows is more robust than trying
-                # to delete it (Caddy header_up -Origin can be silently
-                # ignored on some builds).
+                # Rewrite Origin to a value Ollama always trusts.
                 header_up Origin "http://localhost"
-                # ------------------------------------------------------------
               }
             }
             handle {
@@ -331,9 +285,7 @@ jobs:
             }
           }
           EOF
-
           ./caddy run --config Caddyfile > caddy.log 2>&1 &
-
           echo "Waiting for Caddy to start..."
           for i in {1..15}; do
             if curl -s http://127.0.0.1:3000/ > /dev/null; then
@@ -342,14 +294,12 @@ jobs:
             fi
             sleep 1
           done
-
           if ! curl -s http://127.0.0.1:3000/ > /dev/null; then
             echo "Failed to start Caddy. Log output:"
             cat caddy.log
             exit 1
           fi
-
-          # ---- End-to-end smoke test through Caddy, browser-like request ----
+          # Sanity check through Caddy (404 = origin ok, 403 = origin blocked)
           CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Origin: https://foo.trycloudflare.com' \
             -H 'Content-Type: application/json' \
@@ -362,30 +312,50 @@ jobs:
             exit 1
           fi
 
+      # =====================================================================
+      # FIX: Cloudflare Tunnel step
+      # ---------------------------------------------------------------------
+      # The URL-grep loop was dying on the first iteration because GitHub
+      # Actions runs bash with `-e -o pipefail`, and `grep` exits 1 when
+      # there is no match yet. The pipeline therefore returned 1, which
+      # `set -e` treated as a fatal error before the `if` even ran.
+      # Fix: swallow grep's exit code with `|| true`, silence grep's
+      # stderr, and add a liveness check on the cloudflared process.
+      # =====================================================================
       - name: Start Cloudflare Tunnel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
           chmod +x cloudflared
           ./cloudflared tunnel --url http://127.0.0.1:3000 \
             --no-autoupdate > cf.log 2>&1 &
+          CLOUDFLARED_PID=$!
 
           echo "Waiting for Cloudflare tunnel URL..."
           PUBLIC_URL=""
-          for i in {1..20}; do
-            PUBLIC_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf.log | head -n 1)
-            if [ -n "$PUBLIC_URL" ]; then break; fi
+          for i in {1..30}; do
+            # `|| true` is essential: with pipefail, a no-match grep aborts the script.
+            PUBLIC_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cf.log 2>/dev/null | head -n 1 || true)
+            if [ -n "$PUBLIC_URL" ]; then
+              echo "Got URL: $PUBLIC_URL"
+              break
+            fi
+            if ! kill -0 $CLOUDFLARED_PID 2>/dev/null; then
+              echo "::error::cloudflared exited before publishing a URL"
+              cat cf.log
+              exit 1
+            fi
             sleep 2
           done
 
           if [ -z "$PUBLIC_URL" ]; then
-            echo "Failed to get Cloudflare URL."
+            echo "::error::Failed to get Cloudflare URL after 60s"
             cat cf.log
             exit 1
           fi
 
           echo "PUBLIC_URL=$PUBLIC_URL" >> $GITHUB_ENV
 
-          # ---- End-to-end test against the public tunnel URL ----
+          # End-to-end test against the public tunnel URL
           CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Content-Type: application/json' \
             -d '{"model":"__probe__","messages":[{"role":"user","content":"x"}],"stream":false}' \
@@ -398,9 +368,7 @@ jobs:
             echo "🔗 **Access URL:** [$PUBLIC_URL]($PUBLIC_URL)"
             echo ""
             echo "**Diagnostics**"
-            echo "- Local Caddy POST test: HTTP $CODE"
-            echo "- If you still see 403 in the browser, open DevTools → Network →"
-            echo "  check the response body of the failing `/api/chat` request."
+            echo "- Public tunnel POST /api/chat: HTTP $CODE (404 = OK, 403 = origin blocked)"
             echo ""
             echo "*Note: The link expires when the job finishes (max 6 hours).*"
           } >> $GITHUB_STEP_SUMMARY
