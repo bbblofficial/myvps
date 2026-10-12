@@ -36,24 +36,52 @@ jobs:
           # 1a. Download the stable-diffusion.cpp CPU binary from GitHub Releases
           # ------------------------------------------------------------------
           echo "Fetching latest stable-diffusion.cpp release tag..."
-          LATEST_TAG=$(curl -s https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest | jq -r .tag_name)
+          
+          # Fetch with explicit Accept header and better error handling
+          RESPONSE=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest")
+          
+          echo "API Response (first 500 chars): ${RESPONSE:0:500}"
+          
+          # Check if response contains error or is empty
+          if echo "$RESPONSE" | jq -e '.message' &>/dev/null; then
+            echo "::warning::GitHub API error: $(echo "$RESPONSE" | jq -r '.message // "Unknown error"')"
+            echo "Attempting fallback: querying releases list..."
+            RESPONSE=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases?per_page=10")
+          fi
+          
+          # Extract tag_name safely
+          LATEST_TAG=$(echo "$RESPONSE" | jq -r '.[0].tag_name // .tag_name // empty' 2>/dev/null || echo "")
+          
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "::error::Could not determine latest release tag. API response:"
+            echo "$RESPONSE" | head -c 800
+            exit 1
+          fi
+          
           echo "Latest release tag: $LATEST_TAG"
 
+          # Try downloading with the exact tag
           BINARY_ZIP="sd-${LATEST_TAG}-bin-Linux-Ubuntu-24.04-x86_64.zip"
           BINARY_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/${LATEST_TAG}/${BINARY_ZIP}"
           echo "Trying: $BINARY_URL"
 
-          if ! wget -q "$BINARY_URL" -O sd-bin.zip; then
+          if ! wget -q "$BINARY_URL" -O sd-bin.zip 2>/dev/null; then
             echo "::warning::Direct asset name failed. Querying GitHub API for available assets..."
-            ASSET_URL=$(curl -s "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest" \
-              | jq -r '.assets[] | select(.name | test("bin-Linux-Ubuntu.*x86_64\\.zip$")) | .browser_download_url' \
-              | head -n1)
-            if [ -z "$ASSET_URL" ]; then
+            ASSET_URL=$(echo "$RESPONSE" | jq -r '.assets[]? | select(.name | test("bin-Linux-Ubuntu.*x86_64\\.zip$")) | .browser_download_url' | head -n1)
+            
+            if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
               echo "::error::Could not find a Linux CPU asset in the latest release."
+              echo "Available assets:"
+              echo "$RESPONSE" | jq '.assets[]? | {name, url: .browser_download_url}' | head -c 1000
               exit 1
             fi
             echo "Fallback asset URL: $ASSET_URL"
-            wget -q "$ASSET_URL" -O sd-bin.zip
+            wget -q "$ASSET_URL" -O sd-bin.zip || {
+              echo "::error::Failed to download from fallback URL"
+              exit 1
+            }
           fi
 
           echo "Extracting binary (all .so files must stay next to sd-cli)..."
