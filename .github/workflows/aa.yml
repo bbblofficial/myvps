@@ -21,7 +21,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl wget jq psmisc python3-venv python3-pip
+          sudo apt-get install -y curl wget jq psmisc python3-venv python3-pip unzip
 
       # ============================================================
       # 1. IMAGE — POCKET-Zimage-CPU (No GPU, No Python, No CUDA)
@@ -32,24 +32,79 @@ jobs:
           mkdir -p pocket-zimage
           cd pocket-zimage
 
-          echo "Downloading POCKET-Zimage-CPU binary ..."
-          # The binary is a pre-built stable-diffusion.cpp executable
-          wget -q "https://huggingface.co/FINAL-Bench/POCKET-Zimage-CPU/resolve/main/sd" -O sd
-          chmod +x sd
+          # ------------------------------------------------------------------
+          # 1a. Download the stable-diffusion.cpp CPU binary from GitHub Releases
+          #     Asset name pattern: sd-master-<hash>-bin-Linux-Ubuntu-24.04-x86_64.zip
+          # ------------------------------------------------------------------
+          echo "Fetching latest stable-diffusion.cpp release tag..."
+          LATEST_TAG=$(curl -s https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest | jq -r .tag_name)
+          echo "Latest release tag: $LATEST_TAG"
 
-          echo "Downloading Z-Image-Turbo model weights (Q4_K) ..."
-          wget -q "https://huggingface.co/FINAL-Bench/POCKET-Zimage-CPU/resolve/main/z_image_turbo-Q4_K.gguf" -O z_image_turbo-Q4_K.gguf
+          # The asset name includes a short hash from the tag (e.g. master-956-1b0ba10 -> 1b0ba10)
+          TAG_HASH=$(echo "$LATEST_TAG" | sed -n 's/.*-\([a-f0-9]*\)$/\1/p')
+          if [ -z "$TAG_HASH" ]; then
+            TAG_HASH=$(echo "$LATEST_TAG" | cut -d'-' -f1)
+          fi
+          echo "Tag hash: $TAG_HASH"
 
-          echo "Downloading VAE ..."
-          wget -q "https://huggingface.co/FINAL-Bench/POCKET-Zimage-CPU/resolve/main/ae.safetensors" -O ae.safetensors
+          BINARY_ZIP="sd-${LATEST_TAG}-bin-Linux-Ubuntu-24.04-x86_64.zip"
+          BINARY_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/${LATEST_TAG}/${BINARY_ZIP}"
+          echo "Downloading: $BINARY_URL"
 
-          echo "Downloading text encoder (Qwen3-4B-Instruct) ..."
-          wget -q "https://huggingface.co/FINAL-Bench/POCKET-Zimage-CPU/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf" -O Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+          if ! wget -q "$BINARY_URL" -O sd-bin.zip; then
+            echo "::warning::Direct asset name failed. Querying GitHub API for available assets..."
+            ASSET_URL=$(curl -s "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest" \
+              | jq -r '.assets[] | select(.name | test("bin-Linux-Ubuntu.*x86_64\\.zip$")) | .browser_download_url' \
+              | head -n1)
+            if [ -z "$ASSET_URL" ]; then
+              echo "::error::Could not find a Linux CPU asset in the latest release."
+              exit 1
+            fi
+            echo "Fallback asset URL: $ASSET_URL"
+            wget -q "$ASSET_URL" -O sd-bin.zip
+          fi
 
+          echo "Extracting binary..."
+          unzip -o sd-bin.zip
+          rm -f sd-bin.zip
+
+          # The binary is inside a bin/ folder; find and move it.
+          SD_BIN=$(find . -name 'sd-cli' -o -name 'sd' | head -n 1)
+          if [ -z "$SD_BIN" ]; then
+            echo "::error::Could not find 'sd-cli' executable in the archive."
+            find . -type f | head -n 50
+            exit 1
+          fi
+          mv "$SD_BIN" ./sd-cli
+          chmod +x ./sd-cli
+          echo "Binary ready: $(ls -lh sd-cli)"
+
+          # ------------------------------------------------------------------
+          # 1b. Download the diffusion model (correct file name from repo)
+          # ------------------------------------------------------------------
+          echo "Downloading Z-Image-Turbo diffusion model (Q4_0 pocket)..."
+          wget -q "https://huggingface.co/FINAL-Bench/POCKET-Zimage-CPU/resolve/main/z_image_turbo-Q4_0-pocket.gguf" \
+            -O z_image_turbo-Q4_0-pocket.gguf
+
+          # ------------------------------------------------------------------
+          # 1c. Download the text encoder (Qwen3-4B-Instruct-2507 Q4_K_M)
+          # ------------------------------------------------------------------
+          echo "Downloading Qwen3-4B-Instruct-2507 text encoder..."
+          wget -q "https://huggingface.co/lmstudio-community/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf" \
+            -O Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+
+          # ------------------------------------------------------------------
+          # 1d. Download the VAE (ae.safetensors from Comfy-Org split files)
+          # ------------------------------------------------------------------
+          echo "Downloading VAE (ae.safetensors)..."
+          wget -q "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors" \
+            -O ae.safetensors
+
+          echo "Verifying downloaded files:"
           ls -lh
           echo "POCKET-Zimage-CPU setup complete."
 
-      - name: Write image server (async job queue → sd binary)
+      - name: Write image server (async job queue → sd-cli binary)
         run: |
           mkdir -p server
           cat > server/image_server.py <<'PYEOF'
@@ -62,9 +117,9 @@ jobs:
           # ------------------------------------------------------------------
           # POCKET-Zimage-CPU configuration
           # ------------------------------------------------------------------
-          MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "pocket-zimage")
-          SD_BINARY   = os.path.join(MODEL_DIR, "sd")
-          DIFF_MODEL  = os.path.join(MODEL_DIR, "z_image_turbo-Q4_K.gguf")
+          MODEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "pocket-zimage"))
+          SD_BINARY   = os.path.join(MODEL_DIR, "sd-cli")
+          DIFF_MODEL  = os.path.join(MODEL_DIR, "z_image_turbo-Q4_0-pocket.gguf")
           VAE_MODEL   = os.path.join(MODEL_DIR, "ae.safetensors")
           LLM_MODEL   = os.path.join(MODEL_DIR, "Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
 
@@ -77,7 +132,7 @@ jobs:
               """Verify all required model files exist."""
               missing = []
               for label, path in [
-                  ("sd binary",       SD_BINARY),
+                  ("sd-cli binary",   SD_BINARY),
                   ("diffusion model", DIFF_MODEL),
                   ("VAE",             VAE_MODEL),
                   ("text encoder",    LLM_MODEL),
@@ -88,6 +143,7 @@ jobs:
                   STATE["error"] = "Missing files: " + "; ".join(missing)
                   return False
               STATE["ready"] = True
+              STATE["error"] = None
               return True
 
           app = FastAPI()
@@ -156,6 +212,7 @@ jobs:
                           "-o", out_png,
                           "--fa",              # flash attention
                           "--vae-tiling",      # reduces RAM by ~1.27 GB
+                          "-t", "4",           # 4 physical cores on GH runner
                       ]
 
                       t0 = time.time()
@@ -165,7 +222,7 @@ jobs:
 
                       if result.returncode != 0:
                           raise Exception(
-                              f"sd exited {result.returncode}: {result.stderr[-800:]}"
+                              f"sd-cli exited {result.returncode}: {result.stderr[-800:]}"
                           )
 
                       with open(out_png, "rb") as f:
@@ -229,7 +286,7 @@ jobs:
           echo "Image server launched (POCKET-Zimage-CPU)."
 
       # ============================================================
-      # 2. CHAT — Ollama + Daredevil-8B-abliterated
+      # 2. CHAT — Ollama + Daredevil-8B-abliterated (UNCHANGED)
       # ============================================================
       - name: Install & start Ollama
         run: |
