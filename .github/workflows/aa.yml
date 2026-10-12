@@ -49,10 +49,15 @@ jobs:
             echo "Attempting fallback: querying releases list..."
             RESPONSE=$(curl -s -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases?per_page=10")
+            # Isolate the first release object from the array
+            RELEASE_OBJ=$(echo "$RESPONSE" | jq -c '.[0]')
+          else
+            # It's already a single release object
+            RELEASE_OBJ="$RESPONSE"
           fi
           
           # Extract tag_name safely
-          LATEST_TAG=$(echo "$RESPONSE" | jq -r '.[0].tag_name // .tag_name // empty' 2>/dev/null || echo "")
+          LATEST_TAG=$(echo "$RELEASE_OBJ" | jq -r '.tag_name // empty' 2>/dev/null || echo "")
           
           if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
             echo "::error::Could not determine latest release tag. API response:"
@@ -69,12 +74,13 @@ jobs:
 
           if ! wget -q "$BINARY_URL" -O sd-bin.zip 2>/dev/null; then
             echo "::warning::Direct asset name failed. Querying GitHub API for available assets..."
-            ASSET_URL=$(echo "$RESPONSE" | jq -r '.assets[]? | select(.name | test("bin-Linux-Ubuntu.*x86_64\\.zip$")) | .browser_download_url' | head -n1)
+            # Case-insensitive regex match to catch both "bin-Linux-Ubuntu" and "bin-linux-ubuntu"
+            ASSET_URL=$(echo "$RELEASE_OBJ" | jq -r '.assets[]? | select(.name | test("bin-linux-ubuntu.*x86_64\\.zip$"; "i")) | .browser_download_url' | head -n1)
             
             if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
               echo "::error::Could not find a Linux CPU asset in the latest release."
               echo "Available assets:"
-              echo "$RESPONSE" | jq '.assets[]? | {name, url: .browser_download_url}' | head -c 1000
+              echo "$RELEASE_OBJ" | jq '.assets[]? | {name, url: .browser_download_url}' | head -c 1000
               exit 1
             fi
             echo "Fallback asset URL: $ASSET_URL"
