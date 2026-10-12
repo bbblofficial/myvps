@@ -312,7 +312,8 @@ jobs:
         run: |
           python3 -m venv $HOME/venv
           $HOME/venv/bin/pip install --upgrade pip
-          $HOME/venv/bin/pip install "fastapi[standard]" "uvicorn[standard]" pydantic
+          # Added huggingface_hub here so the next script doesn't crash!
+          $HOME/venv/bin/pip install "fastapi[standard]" "uvicorn[standard]" pydantic huggingface_hub
 
       - name: Start image server
         run: |
