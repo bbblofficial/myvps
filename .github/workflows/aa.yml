@@ -271,8 +271,15 @@ jobs:
           :3000 {
             handle /api/* {
               reverse_proxy 127.0.0.1:11434 {
-                # Rewrite Origin to a value Ollama always trusts.
+                # ---- FIX 2: Host + Origin header rewrite -------------------
+                # Ollama has two independent 403 guards:
+                #   1. Origin guard (CORS)  -> fixed by OLLAMA_ORIGINS or rewriting Origin
+                #   2. Host guard (DNS-rebinding protection) -> fixed by rewriting Host
+                # The Host guard is what still returns 403 through a tunnel,
+                # even with OLLAMA_ORIGINS='*', because it runs before CORS.
+                header_up Host "127.0.0.1:11434"
                 header_up Origin "http://localhost"
+                # ------------------------------------------------------------
               }
             }
             handle {
@@ -295,6 +302,7 @@ jobs:
             cat caddy.log
             exit 1
           fi
+          # Sanity check through Caddy (404 = origin ok, 403 = origin blocked)
           CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Origin: https://foo.trycloudflare.com' \
             -H 'Content-Type: application/json' \
@@ -307,12 +315,6 @@ jobs:
             exit 1
           fi
 
-      # =====================================================================
-      # FIX: exit code 6 was curl's CURLE_COULDNT_RESOLVE_HOST on the freshly
-      # published *.trycloudflare.com hostname. DNS for the new subdomain
-      # takes a few seconds to propagate. We now retry the probe, tolerate
-      # curl failures, and treat the probe as informational only.
-      # =====================================================================
       - name: Start Cloudflare Tunnel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
@@ -348,7 +350,6 @@ jobs:
           # ---- End-to-end test against the public tunnel URL ----
           # Retry because DNS for a brand-new trycloudflare subdomain
           # is not instantly resolvable (curl exit 6 = couldn't resolve host).
-          # Non-fatal: it's a diagnostic, not a gate.
           CODE="000"
           for i in {1..10}; do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
