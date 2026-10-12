@@ -21,7 +21,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl wget jq psmisc python3-venv python3-pip unzip
+          sudo apt-get install -y curl wget jq psmisc python3-venv python3-pip unzip libgomp1
 
       # ============================================================
       # 1. IMAGE — POCKET-Zimage-CPU (No GPU, No Python, No CUDA)
@@ -34,22 +34,14 @@ jobs:
 
           # ------------------------------------------------------------------
           # 1a. Download the stable-diffusion.cpp CPU binary from GitHub Releases
-          #     Asset name pattern: sd-master-<hash>-bin-Linux-Ubuntu-24.04-x86_64.zip
           # ------------------------------------------------------------------
           echo "Fetching latest stable-diffusion.cpp release tag..."
           LATEST_TAG=$(curl -s https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest | jq -r .tag_name)
           echo "Latest release tag: $LATEST_TAG"
 
-          # The asset name includes a short hash from the tag (e.g. master-956-1b0ba10 -> 1b0ba10)
-          TAG_HASH=$(echo "$LATEST_TAG" | sed -n 's/.*-\([a-f0-9]*\)$/\1/p')
-          if [ -z "$TAG_HASH" ]; then
-            TAG_HASH=$(echo "$LATEST_TAG" | cut -d'-' -f1)
-          fi
-          echo "Tag hash: $TAG_HASH"
-
           BINARY_ZIP="sd-${LATEST_TAG}-bin-Linux-Ubuntu-24.04-x86_64.zip"
           BINARY_URL="https://github.com/leejet/stable-diffusion.cpp/releases/download/${LATEST_TAG}/${BINARY_ZIP}"
-          echo "Downloading: $BINARY_URL"
+          echo "Trying: $BINARY_URL"
 
           if ! wget -q "$BINARY_URL" -O sd-bin.zip; then
             echo "::warning::Direct asset name failed. Querying GitHub API for available assets..."
@@ -64,23 +56,30 @@ jobs:
             wget -q "$ASSET_URL" -O sd-bin.zip
           fi
 
-          echo "Extracting binary..."
+          echo "Extracting binary (all .so files must stay next to sd-cli)..."
           unzip -o sd-bin.zip
           rm -f sd-bin.zip
 
-          # The binary is inside a bin/ folder; find and move it.
-          SD_BIN=$(find . -name 'sd-cli' -o -name 'sd' | head -n 1)
-          if [ -z "$SD_BIN" ]; then
-            echo "::error::Could not find 'sd-cli' executable in the archive."
+          # The archive extracts sd-cli + all its .so deps directly into CWD.
+          # No need to move anything — just verify it exists and is executable.
+          if [ ! -f ./sd-cli ]; then
+            echo "::error::sd-cli not found after extraction."
             find . -type f | head -n 50
             exit 1
           fi
-          mv "$SD_BIN" ./sd-cli
           chmod +x ./sd-cli
-          echo "Binary ready: $(ls -lh sd-cli)"
+
+          echo "Binary ready:"
+          ls -lh sd-cli
+          echo "Shared libraries present:"
+          ls -1 ./*.so* 2>/dev/null | head -n 40
+
+          # Quick sanity check: verify the binary can at least load its libs
+          echo "Testing binary (should print version/help header):"
+          LD_LIBRARY_PATH=. ./sd-cli --help 2>&1 | head -n 5 || true
 
           # ------------------------------------------------------------------
-          # 1b. Download the diffusion model (correct file name from repo)
+          # 1b. Download the diffusion model
           # ------------------------------------------------------------------
           echo "Downloading Z-Image-Turbo diffusion model (Q4_0 pocket)..."
           wget -q "https://huggingface.co/FINAL-Bench/POCKET-Zimage-CPU/resolve/main/z_image_turbo-Q4_0-pocket.gguf" \
@@ -94,7 +93,7 @@ jobs:
             -O Qwen3-4B-Instruct-2507-Q4_K_M.gguf
 
           # ------------------------------------------------------------------
-          # 1d. Download the VAE (ae.safetensors from Comfy-Org split files)
+          # 1d. Download the VAE
           # ------------------------------------------------------------------
           echo "Downloading VAE (ae.safetensors)..."
           wget -q "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors" \
@@ -129,7 +128,7 @@ jobs:
           JOB_TTL = 3600
 
           def check_ready():
-              """Verify all required model files exist."""
+              """Verify all required model files + binary exist."""
               missing = []
               for label, path in [
                   ("sd-cli binary",   SD_BINARY),
@@ -146,6 +145,10 @@ jobs:
               STATE["error"] = None
               return True
 
+          # Runtime environment so sd-cli finds its .so siblings
+          RUNTIME_ENV = os.environ.copy()
+          RUNTIME_ENV["LD_LIBRARY_PATH"] = MODEL_DIR + ":" + RUNTIME_ENV.get("LD_LIBRARY_PATH", "")
+
           app = FastAPI()
           app.add_middleware(
               CORSMiddleware, allow_origins=["*"],
@@ -155,7 +158,7 @@ jobs:
           class GenRequest(BaseModel):
               prompt: str
               negative_prompt: str = ""
-              steps: int = 3           # Z-Image-Turbo: 3 is the sweet spot
+              steps: int = 3
               guidance_scale: float = 1.0
               width: int = 512
               height: int = 512
@@ -210,14 +213,15 @@ jobs:
                           "--cfg-scale", str(req.guidance_scale),
                           "-s", str(req.seed) if req.seed != -1 else "-1",
                           "-o", out_png,
-                          "--fa",              # flash attention
-                          "--vae-tiling",      # reduces RAM by ~1.27 GB
-                          "-t", "4",           # 4 physical cores on GH runner
+                          "--fa",
+                          "--vae-tiling",
+                          "-t", "4",
                       ]
 
                       t0 = time.time()
                       result = subprocess.run(
-                          cmd, capture_output=True, text=True, timeout=600
+                          cmd, capture_output=True, text=True,
+                          timeout=600, cwd=MODEL_DIR, env=RUNTIME_ENV
                       )
 
                       if result.returncode != 0:
@@ -504,7 +508,6 @@ jobs:
             <div class="badge" id="statusBadge">ready</div>
           </header>
 
-          <!-- ================= CHAT VIEW ================= -->
           <div id="chatView" class="view active">
             <div id="chat">
               <div class="message ai">
@@ -524,7 +527,6 @@ jobs:
             </div>
           </div>
 
-          <!-- ================= IMAGE VIEW ================= -->
           <div id="imageView" class="view">
             <div class="img-form">
               <div>
@@ -574,7 +576,6 @@ jobs:
               document.getElementById(name + 'View').classList.add('active');
             }
 
-            /* ---------- CHAT ---------- */
             const chatDiv  = document.getElementById('chat');
             const promptEl = document.getElementById('prompt');
             const btnSend  = document.getElementById('btnSend');
@@ -663,7 +664,6 @@ jobs:
               }
             }
 
-            /* ---------- IMAGE (async + polling) ---------- */
             const btnGen    = document.getElementById('btnGen');
             const imgOutput = document.getElementById('imgOutput');
 
@@ -699,7 +699,6 @@ jobs:
                 '<div class="spinner" style="margin:0 auto 1rem"></div>' +
                 '<div class="placeholder">Submitting job…</div></div>';
 
-              // 1) Submit
               let jobId;
               try{
                 const res  = await fetch('/image/generate', {
@@ -723,7 +722,6 @@ jobs:
                 return showError('Network error', err.message);
               }
 
-              // 2) Poll
               const t0 = Date.now();
               async function poll(){
                 try{
