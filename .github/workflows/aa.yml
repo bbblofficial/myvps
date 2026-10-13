@@ -1,4 +1,4 @@
-name: Unified AI Panel (Qwen2.5-7B + CPU Image Gen) via TryCloudflare
+name: Unified AI Panel (Claude UI + Qwen2.5-7B + CPU SD)
 
 on:
   workflow_dispatch:
@@ -14,17 +14,19 @@ jobs:
       # ============================================================
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL || true
           sudo apt-get clean
           df -h /
 
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl wget jq psmisc python3-venv python3-pip unzip libgomp1
+          sudo apt-get install -y curl wget jq psmisc python3-venv python3-pip \
+                                  unzip libgomp1
 
       # ============================================================
-      # 1. IMAGE — CPU diffusion backend (stable-diffusion.cpp, single model)
+      # 1. IMAGE ENGINE — stable-diffusion.cpp binary + SD1.5
       # ============================================================
       - name: Download CPU image-gen binary + model
         run: |
@@ -37,7 +39,7 @@ jobs:
             "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest")
 
           if echo "$RESPONSE" | jq -e '.message' &>/dev/null; then
-            echo "::warning::GitHub API error: $(echo "$RESPONSE" | jq -r '.message // "Unknown error"')"
+            echo "::warning::GitHub API error: $(echo "$RESPONSE" | jq -r '.message // "Unknown"')"
             RESPONSE=$(curl -s -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases?per_page=10")
             RELEASE_OBJ=$(echo "$RESPONSE" | jq -c '.[0]')
@@ -58,7 +60,7 @@ jobs:
           echo "Trying: $BINARY_URL"
 
           if ! wget -q "$BINARY_URL" -O sd-bin.zip 2>/dev/null; then
-            echo "::warning::Direct asset name failed. Querying GitHub API for available assets..."
+            echo "::warning::Direct asset name failed. Querying API for available assets..."
             ASSET_URL=$(echo "$RELEASE_OBJ" | jq -r '.assets[]? | select(.name | test("bin-linux-ubuntu.*x86_64\\.zip$"; "i")) | .browser_download_url' | head -n1)
             if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
               echo "::error::Could not find a Linux CPU asset in the latest release."
@@ -71,9 +73,8 @@ jobs:
           rm -f sd-bin.zip
 
           if [ -f ./sd-cli ]; then
-            SD_BIN=./sd-cli
+            :
           elif [ -f ./sd ]; then
-            SD_BIN=./sd
             cp ./sd ./sd-cli
           else
             echo "::error::No sd-cli/sd binary found after extraction."
@@ -82,20 +83,21 @@ jobs:
           fi
           chmod +x ./sd-cli
           ls -lh sd-cli
-          LD_LIBRARY_PATH=. ./sd-cli --help 2>&1 | head -n 20 || true
+          LD_LIBRARY_PATH=. ./sd-cli --help 2>&1 | head -n 15 || true
 
-          echo "Downloading Stable Diffusion 1.5 checkpoint (single file, quantized at load time)..."
+          echo "Downloading Stable Diffusion 1.5 checkpoint..."
           wget -q "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors" \
             -O sd-v1-5.safetensors
 
           ls -lh
           echo "Image engine setup complete."
 
-      - name: Write image server (async job queue → sd-cli binary, with real timeout + error surfacing)
+      - name: Write image server (matches Claude UI API contract)
         run: |
           mkdir -p server
           cat > server/image_server.py <<'PYEOF'
-          import os, base64, time, uuid, threading, traceback, subprocess
+          import os, base64, time, uuid, threading, traceback, subprocess, re
+          import urllib.request
           from fastapi import FastAPI
           from fastapi.middleware.cors import CORSMiddleware
           from fastapi.responses import JSONResponse
@@ -103,26 +105,77 @@ jobs:
 
           MODEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "image-engine"))
           SD_BINARY = os.path.join(MODEL_DIR, "sd-cli")
-          SD_MODEL  = os.path.join(MODEL_DIR, "sd-v1-5.safetensors")
-
           GEN_TIMEOUT_SECONDS = 12 * 60
 
-          STATE = {"ready": False, "model": "sd-v1-5 (CPU, q8_0)", "error": None}
+          CATALOG = [
+              {
+                  "id": "sd15",
+                  "name": "Stable Diffusion 1.5",
+                  "file": "sd-v1-5.safetensors",
+                  "size_gb": 4.27,
+                  "badges": ["Recommended"],
+                  "desc": "Classic SD1.5 base. Balanced quality and CPU speed.",
+                  "url": "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors",
+                  "steps": 15,
+                  "cfg": 7.5,
+              },
+              {
+                  "id": "sdturbo",
+                  "name": "SD-Turbo",
+                  "file": "sd-turbo.safetensors",
+                  "size_gb": 4.27,
+                  "badges": ["Fastest"],
+                  "desc": "Distilled SD. Usable images in 1-4 steps.",
+                  "url": "https://huggingface.co/stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors",
+                  "steps": 4,
+                  "cfg": 1.0,
+              },
+          ]
+
+          STATE = {"ready": False, "error": None}
           JOBS = {}
+          INSTALLS = {}
           JOB_LOCK = threading.Lock()
           JOB_TTL = 3600
 
+          def list_installed():
+              out = []
+              if not os.path.isdir(MODEL_DIR):
+                  return out
+              for f in sorted(os.listdir(MODEL_DIR)):
+                  if f.endswith((".safetensors", ".ckpt")):
+                      path = os.path.join(MODEL_DIR, f)
+                      try:
+                          size = os.path.getsize(path)
+                      except OSError:
+                          continue
+                      meta = next((c for c in CATALOG if c["file"] == f), None)
+                      out.append({
+                          "name": meta["name"] if meta else f,
+                          "file": f,
+                          "size": size,
+                          "steps": meta["steps"] if meta else 15,
+                          "cfg": meta["cfg"] if meta else 7.5,
+                      })
+              return out
+
+          def disk_free_gb():
+              try:
+                  path = MODEL_DIR if os.path.isdir(MODEL_DIR) else "/"
+                  s = os.statvfs(path)
+                  return round(s.f_bavail * s.f_frsize / 1e9, 1)
+              except Exception:
+                  return None
+
           def check_ready():
               missing = []
-              for label, path in [
-                  ("sd-cli binary", SD_BINARY),
-                  ("model checkpoint", SD_MODEL),
-              ]:
-                  if not os.path.isfile(path):
-                      missing.append(f"{label}: {path}")
+              if not os.path.isfile(SD_BINARY):
+                  missing.append("sd-cli")
+              if not list_installed():
+                  missing.append("no model checkpoint")
               if missing:
-                  STATE["error"] = "Missing files: " + "; ".join(missing)
                   STATE["ready"] = False
+                  STATE["error"] = "Missing: " + ", ".join(missing)
                   return False
               STATE["ready"] = True
               STATE["error"] = None
@@ -140,33 +193,135 @@ jobs:
           class GenRequest(BaseModel):
               prompt: str
               negative_prompt: str = ""
+              model: str = ""
               steps: int = 15
               guidance_scale: float = 7.5
               width: int = 512
               height: int = 512
               seed: int = -1
 
-          def _purge_jobs():
+          class InstallRequest(BaseModel):
+              id: str = ""
+              url: str = ""
+
+          class KeyRequest(BaseModel):
+              key: str = ""
+              file: str = ""
+
+          def _purge():
               now = time.time()
               with JOB_LOCK:
-                  dead = [k for k, v in JOBS.items()
-                          if now - v.get("created", now) > JOB_TTL]
+                  dead = [k for k, v in JOBS.items() if now - v.get("created", now) > JOB_TTL]
                   for k in dead:
                       JOBS.pop(k, None)
 
           @app.get("/health")
           def health():
-              _purge_jobs()
-              if not STATE["ready"]:
-                  check_ready()
-              return STATE
+              _purge()
+              check_ready()
+              return {"ready": STATE["ready"], "error": STATE["error"],
+                      "installed": list_installed()}
+
+          @app.get("/models")
+          def models():
+              check_ready()
+              return {
+                  "ready": STATE["ready"],
+                  "catalog": CATALOG,
+                  "installed": list_installed(),
+                  "installs": INSTALLS,
+                  "disk_free_gb": disk_free_gb(),
+              }
+
+          def _download_install(key, url, filename):
+              target = os.path.join(MODEL_DIR, filename)
+              tmp = target + ".part"
+              INSTALLS[key] = {
+                  "status": "starting", "total": 0, "downloaded": 0,
+                  "started": time.time(), "error": None, "file": filename,
+                  "cancel": False,
+              }
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      total = int(r.headers.get("Content-Length") or 0)
+                      INSTALLS[key]["total"] = total
+                      INSTALLS[key]["status"] = "downloading"
+                      done = 0
+                      with open(tmp, "wb") as f:
+                          while True:
+                              if INSTALLS[key].get("cancel"):
+                                  raise Exception("Cancelled")
+                              chunk = r.read(1024 * 256)
+                              if not chunk:
+                                  break
+                              f.write(chunk)
+                              done += len(chunk)
+                              INSTALLS[key]["downloaded"] = done
+                  os.replace(tmp, target)
+                  INSTALLS[key]["status"] = "done"
+              except Exception as e:
+                  INSTALLS[key]["status"] = "error"
+                  INSTALLS[key]["error"] = f"{type(e).__name__}: {e}"
+                  try:
+                      if os.path.exists(tmp):
+                          os.remove(tmp)
+                  except Exception:
+                      pass
+
+          @app.post("/models/install")
+          def install(req: InstallRequest):
+              os.makedirs(MODEL_DIR, exist_ok=True)
+              if req.id:
+                  meta = next((c for c in CATALOG if c["id"] == req.id), None)
+                  if not meta:
+                      return JSONResponse({"error": "Unknown model id"}, status_code=404)
+                  key = req.id
+                  filename = meta["file"]
+                  url = meta["url"]
+              elif req.url:
+                  key = "custom:" + uuid.uuid4().hex[:8]
+                  base = os.path.basename(req.url.split("?")[0]) or ("custom-" + uuid.uuid4().hex[:6] + ".safetensors")
+                  if not base.endswith((".safetensors", ".ckpt")):
+                      base += ".safetensors"
+                  filename = base
+                  url = req.url
+              else:
+                  return JSONResponse({"error": "Provide id or url"}, status_code=400)
+              threading.Thread(target=_download_install,
+                               args=(key, url, filename), daemon=True).start()
+              return {"key": key, "status": "starting"}
+
+          @app.post("/models/cancel")
+          def cancel(req: KeyRequest):
+              st = INSTALLS.get(req.key)
+              if not st:
+                  return JSONResponse({"error": "unknown key"}, status_code=404)
+              st["cancel"] = True
+              st["status"] = "error"
+              st["error"] = "Cancelled"
+              return {"ok": True}
+
+          @app.post("/models/delete")
+          def delete(req: KeyRequest):
+              if not req.file:
+                  return JSONResponse({"error": "file required"}, status_code=400)
+              path = os.path.join(MODEL_DIR, os.path.basename(req.file))
+              if os.path.isfile(path):
+                  os.remove(path)
+              return {"ok": True}
 
           @app.post("/generate")
           def generate(req: GenRequest):
-              if not STATE["ready"]:
-                  check_ready()
-                  if not STATE["ready"]:
-                      return JSONResponse({"error": "Model not ready", "state": STATE}, status_code=503)
+              if not check_ready():
+                  return JSONResponse(
+                      {"error": "Model not ready", "state": STATE}, status_code=503)
+
+              model_file = req.model or (list_installed()[0]["file"] if list_installed() else "")
+              model_path = os.path.join(MODEL_DIR, os.path.basename(model_file))
+              if not os.path.isfile(model_path):
+                  return JSONResponse(
+                      {"error": f"Model not found: {model_file}"}, status_code=404)
 
               steps = max(1, min(req.steps, 30))
               width = max(256, min(req.width, 768))
@@ -174,14 +329,20 @@ jobs:
 
               job_id = uuid.uuid4().hex
               with JOB_LOCK:
-                  JOBS[job_id] = {"status": "pending", "created": time.time(), "prompt": (req.prompt or "")[:120]}
+                  JOBS[job_id] = {
+                      "status": "queued",
+                      "created": time.time(),
+                      "started": time.time(),
+                      "progress": None,
+                      "prompt": (req.prompt or "")[:120],
+                  }
 
               def run_job():
                   out_png = f"/tmp/{job_id}.png"
                   try:
                       cmd = [
                           SD_BINARY,
-                          "-m", SD_MODEL,
+                          "-m", model_path,
                           "--type", "q8_0",
                           "-p", req.prompt,
                           "-n", req.negative_prompt,
@@ -194,47 +355,61 @@ jobs:
                           "-t", "4",
                       ]
                       t0 = time.time()
-                      try:
-                          result = subprocess.run(
-                              cmd, capture_output=True, text=True,
-                              timeout=GEN_TIMEOUT_SECONDS, cwd=MODEL_DIR, env=RUNTIME_ENV
-                          )
-                      except subprocess.TimeoutExpired:
-                          with JOB_LOCK:
-                              JOBS[job_id].update({
-                                  "status": "error",
-                                  "error": f"Generation exceeded {GEN_TIMEOUT_SECONDS}s and was stopped. "
-                                           f"Try fewer steps or a smaller image."
-                              })
-                          return
+                      proc = subprocess.Popen(
+                          cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, bufsize=1, cwd=MODEL_DIR, env=RUNTIME_ENV
+                      )
+                      with JOB_LOCK:
+                          JOBS[job_id]["status"] = "running"
+                          JOBS[job_id]["started"] = time.time()
 
-                      if result.returncode != 0:
-                          raise Exception(f"sd-cli exited {result.returncode}: {result.stderr[-800:]}")
+                      deadline = time.time() + GEN_TIMEOUT_SECONDS
+                      for line in proc.stdout:
+                          if time.time() > deadline:
+                              proc.kill()
+                              raise Exception(
+                                  f"Generation exceeded {GEN_TIMEOUT_SECONDS}s")
+                          m = re.search(r"(\d+)\s*/\s*(\d+)", line)
+                          if m:
+                              cur, tot = int(m.group(1)), int(m.group(2))
+                              if 0 < cur <= tot <= 200:
+                                  with JOB_LOCK:
+                                      JOBS[job_id]["progress"] = {"cur": cur, "tot": tot}
+                      proc.wait()
 
+                      if proc.returncode != 0:
+                          raise Exception(f"sd-cli exited {proc.returncode}")
                       if not os.path.exists(out_png):
-                          raise Exception(f"sd-cli reported success but produced no output file. stderr: {result.stderr[-500:]}")
+                          raise Exception("sd-cli produced no output")
 
                       with open(out_png, "rb") as f:
-                          img_bytes = f.read()
-
-                      elapsed = time.time() - t0
-                      b64 = base64.b64encode(img_bytes).decode()
+                          b64 = base64.b64encode(f.read()).decode()
                       with JOB_LOCK:
-                          JOBS[job_id].update({"status": "done", "image": b64, "elapsed": elapsed})
+                          JOBS[job_id].update({
+                              "status": "done",
+                              "image": b64,
+                              "elapsed": time.time() - t0,
+                          })
                   except Exception as e:
                       traceback.print_exc()
                       with JOB_LOCK:
-                          JOBS[job_id].update({"status": "error", "error": f"{type(e).__name__}: {e}"})
+                          JOBS[job_id].update({
+                              "status": "error",
+                              "error": f"{type(e).__name__}: {e}",
+                          })
                   finally:
                       if os.path.exists(out_png):
-                          os.remove(out_png)
+                          try:
+                              os.remove(out_png)
+                          except Exception:
+                              pass
 
               threading.Thread(target=run_job, daemon=True).start()
-              return {"job_id": job_id, "status": "pending"}
+              return {"job_id": job_id, "status": "queued"}
 
           @app.get("/status/{job_id}")
           def job_status(job_id: str):
-              _purge_jobs()
+              _purge()
               with JOB_LOCK:
                   job = JOBS.get(job_id)
               if not job:
@@ -247,8 +422,10 @@ jobs:
                   job = JOBS.get(job_id)
               if not job:
                   return JSONResponse({"error": "unknown job"}, status_code=404)
-              if job["status"] != "done":
-                  return JSONResponse({"error": "not ready", "status": job["status"]}, status_code=409)
+              if job.get("status") != "done":
+                  return JSONResponse(
+                      {"error": "not ready", "status": job.get("status")},
+                      status_code=409)
               return {"image": job["image"], "elapsed": job.get("elapsed")}
           PYEOF
 
@@ -319,11 +496,6 @@ jobs:
               echo "Image engine ready."
               exit 0
             fi
-            if echo "$S" | grep -q '"error":"'; then
-              echo "::error::image server failed"
-              cat image_server.log || true
-              exit 1
-            fi
             sleep 2
           done
           echo "::error::image server never became ready"
@@ -331,1047 +503,1141 @@ jobs:
           exit 1
 
       # ============================================================
-      # 3. WEB UI (English only)
+      # 3. WEB UI — Claude-styled single-page app
       # ============================================================
       - name: Build web UI
         run: |
           mkdir -p web
-          cat > web/index.html << 'HTMLEOF'
+          cat > web/index.html <<'CLAUDE_UI_EOF_9d3f'
           <!DOCTYPE html>
-          <html lang="en">
+          <html lang="en" data-theme="light">
           <head>
           <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
           <title>Unified AI</title>
-
-          <!--
-            Pin marked to v4 so renderer.code() keeps the classic signature
-            (code, infostring, escaped) and don't have to guess token shapes.
-          -->
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
           <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
           <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
-
-          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
           <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-
-          <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
           <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
-          <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"></script>
-
-          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-
           <style>
-            :root{
-              --sidebar-w: 260px;
-              --bg-main: #ffffff;
-              --bg-sidebar: #f9f9f9;
-              --bg-hover: #ececec;
-              --bg-active: #e6e6e6;
-              --bg-input: #ffffff;
-              --border: #e5e5e5;
-              --text-primary: #0d0d0d;
-              --text-secondary: #5d5d5d;
-              --text-tertiary: #8e8ea0;
-              --accent: #10a37f;
-              --user-bubble: #f4f4f4;
-              --radius-sm: 6px;
-              --radius-md: 10px;
-              --radius-lg: 16px;
-              --radius-pill: 999px;
-              --font: "Inter", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            }
+          :root{
+            --sw:272px;
+            --ui:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+            --serif:"Source Serif 4","Tiempos Text",Georgia,"Times New Roman",serif;
+            --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+            --ease:cubic-bezier(.2,.7,.2,1);
+            --bg:#faf9f5; --side:#f3f1ea; --surface:#ffffff; --hover:#ebe8de; --active:#e5e2d6;
+            --border:#e8e5da; --border2:#d9d5c6;
+            --text:#1f1e1d; --text2:#5f5d57; --text3:#8f8c82;
+            --accent:#c96442; --accent-h:#b4553a; --accent-soft:rgba(201,100,66,.10);
+            --user:#f0ede3; --danger:#c0392b; --ok:#3d8b5f;
+            --shadow:0 4px 24px rgba(31,30,29,.06);
+          }
+          html[data-theme="dark"]{
+            --bg:#262624; --side:#1f1e1d; --surface:#30302e; --hover:#3a3935; --active:#42413c;
+            --border:#3d3c38; --border2:#54524c;
+            --text:#faf9f5; --text2:#c2c0b6; --text3:#8f8d84;
+            --accent:#d97757; --accent-h:#e48a6c; --accent-soft:rgba(217,119,87,.14);
+            --user:#30302e; --danger:#e57b6d; --ok:#6fbf92;
+            --shadow:0 4px 24px rgba(0,0,0,.35);
+          }
+          *{box-sizing:border-box;margin:0;padding:0}
+          [hidden]{display:none!important}
+          html,body{height:100%}
+          body{font-family:var(--ui);font-size:15px;background:var(--bg);color:var(--text);display:flex;overflow:hidden;-webkit-font-smoothing:antialiased;transition:background .25s,color .25s}
+          button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+          input,textarea,select{font:inherit;color:inherit}
+          .i{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+          .i.sm{width:15px;height:15px}
+          ::selection{background:var(--accent-soft)}
+          *{scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
 
-            *{ box-sizing:border-box; margin:0; padding:0; }
-            html,body{ height:100%; width:100%; }
-            body{
-              font-family: var(--font);
-              background: var(--bg-main);
-              color: var(--text-primary);
-              display:flex;
-              overflow:hidden;
-              font-size:15px;
-              -webkit-font-smoothing: antialiased;
-            }
+          .sidebar{width:var(--sw);background:var(--side);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;transition:margin-left .3s var(--ease),transform .3s var(--ease),background .25s;z-index:50}
+          body.sb-collapsed .sidebar{margin-left:calc(var(--sw) * -1)}
+          .sb-top{display:flex;align-items:center;justify-content:space-between;padding:14px 12px 6px 16px}
+          .brand{display:flex;align-items:center;gap:9px;font-family:var(--serif);font-size:21px;font-weight:500;letter-spacing:-.01em}
+          .brand .i{color:var(--accent);width:22px;height:22px;stroke-width:2.2}
+          .icon-btn{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;color:var(--text2);transition:background .15s,color .15s}
+          .icon-btn:hover{background:var(--hover);color:var(--text)}
+          .new-chat{margin:8px 12px 6px;display:flex;align-items:center;gap:9px;padding:9px 12px;border-radius:12px;background:var(--accent-soft);color:var(--accent);font-weight:500;transition:background .15s,transform .15s}
+          .new-chat:hover{background:color-mix(in srgb,var(--accent) 18%,transparent)}
+          .new-chat:active{transform:scale(.98)}
+          .nav{padding:4px 8px;display:flex;flex-direction:column;gap:1px}
+          .nav-item{display:flex;align-items:center;gap:11px;padding:8px 10px;border-radius:10px;color:var(--text2);text-align:left;transition:background .15s,color .15s}
+          .nav-item:hover{background:var(--hover);color:var(--text)}
+          .nav-item.active{background:var(--active);color:var(--text);font-weight:500}
+          .sb-search{margin:8px 12px 2px}
+          .sb-search input{width:100%;border:1px solid transparent;background:var(--hover);border-radius:10px;padding:8px 11px;font-size:13.5px;outline:none;transition:border-color .15s,background .15s}
+          .sb-search input:focus{border-color:var(--border2);background:var(--surface)}
+          .sb-search input::placeholder{color:var(--text3)}
+          .sb-list{flex:1;overflow-y:auto;padding:4px 8px 8px}
+          .sb-label{font-size:11.5px;font-weight:600;color:var(--text3);padding:14px 10px 5px;letter-spacing:.02em}
+          .conv{display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:9px;cursor:pointer;font-size:14px;color:var(--text2);transition:background .12s}
+          .conv:hover{background:var(--hover);color:var(--text)}
+          .conv.active{background:var(--active);color:var(--text)}
+          .conv-t{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .conv-x{opacity:0;width:24px;height:24px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:var(--text3)}
+          .conv:hover .conv-x{opacity:1}
+          .conv-x:hover{background:var(--border2);color:var(--text)}
+          .sb-foot{padding:10px 12px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+          .status{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text3)}
+          .dot{width:8px;height:8px;border-radius:50%;background:var(--text3);transition:background .3s}
+          .dot.ok{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 22%,transparent)}
+          .dot.bad{background:var(--danger)}
+          .scrim{display:none}
 
-            svg{ display:block; flex-shrink:0; }
-            .icon{ width:18px; height:18px; stroke:currentColor; fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-            .icon-sm{ width:16px; height:16px; }
-            .icon-lg{ width:22px; height:22px; }
+          .main{flex:1;min-width:0;display:flex;flex-direction:column;height:100%}
+          .topbar{display:flex;align-items:center;gap:6px;padding:10px 14px;min-height:56px;flex-shrink:0}
+          .topbar-title{font-family:var(--serif);font-size:18px;font-weight:500;padding:0 6px}
+          .spacer{flex:1}
+          .model-wrap{position:relative}
+          .pill{display:flex;align-items:center;gap:7px;padding:7px 12px;border-radius:11px;font-weight:500;color:var(--text);transition:background .15s;max-width:60vw}
+          .pill:hover{background:var(--hover)}
+          .pill span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .pill .i{color:var(--text3);width:15px;height:15px}
+          .menu{position:absolute;top:calc(100% + 6px);left:0;min-width:270px;max-width:86vw;background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.14);padding:6px;z-index:80;animation:pop .18s var(--ease)}
+          @keyframes pop{from{opacity:0;transform:translateY(-4px) scale(.98)}to{opacity:1;transform:none}}
+          .menu-item{display:flex;align-items:center;gap:10px;width:100%;padding:9px 10px;border-radius:9px;text-align:left;font-size:14px;transition:background .12s}
+          .menu-item:hover{background:var(--hover)}
+          .menu-item small{display:block;color:var(--text3);font-size:12px;margin-top:1px}
+          .menu-item .grow{flex:1;min-width:0}
+          .menu-item .chk{color:var(--accent);width:16px;height:16px}
+          .menu-sep{height:1px;background:var(--border);margin:5px 4px}
 
-            button{ font-family:inherit; border:none; background:none; cursor:pointer; color:inherit; }
+          .view{display:none;flex:1;min-height:0;flex-direction:column}
+          .view.active{display:flex;animation:viewIn .3s var(--ease)}
+          @keyframes viewIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 
-            /* ===================== SIDEBAR ===================== */
-            .sidebar{
-              width: var(--sidebar-w);
-              background: var(--bg-sidebar);
-              display:flex;
-              flex-direction:column;
-              flex-shrink:0;
-              transition: width 0.2s ease;
-              overflow:hidden;
-            }
-            .sidebar.collapsed{ width:0; }
+          .chat-scroll{flex:1;overflow-y:auto}
+          .chat-col{max-width:760px;margin:0 auto;padding:8px 24px 28px;min-height:100%;display:flex;flex-direction:column}
+          .hero{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:6vh 0 4vh;text-align:center;animation:rise .5s var(--ease)}
+          .hero-logo{width:44px;height:44px;color:var(--accent);stroke-width:2}
+          .hero h1{font-family:var(--serif);font-weight:400;font-size:clamp(30px,5vw,42px);letter-spacing:-.015em;line-height:1.15}
+          .hero p{color:var(--text2);max-width:440px;line-height:1.55}
+          .chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:10px}
+          .chip{padding:8px 14px;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--text2);font-size:13.5px;transition:all .15s}
+          .chip:hover{border-color:var(--border2);color:var(--text);transform:translateY(-1px)}
+          .notice{display:flex;align-items:center;gap:14px;border:1px solid var(--border);background:var(--surface);border-radius:16px;padding:14px 16px;text-align:left;max-width:480px;box-shadow:var(--shadow)}
+          .notice b{font-weight:600}
+          .notice div{flex:1;font-size:14px;color:var(--text2);line-height:1.5}
+          .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:8px 14px;border-radius:10px;background:var(--text);color:var(--bg);font-weight:500;font-size:13.5px;transition:opacity .15s,transform .15s,background .15s;white-space:nowrap}
+          .btn:hover{opacity:.88}
+          .btn:active{transform:scale(.97)}
+          .btn.accent{background:var(--accent);color:#fff}
+          .btn.accent:hover{background:var(--accent-h);opacity:1}
+          .btn.ghost{background:transparent;color:var(--text2);border:1px solid var(--border2)}
+          .btn.ghost:hover{background:var(--hover);color:var(--text);opacity:1}
+          .btn.danger{background:transparent;color:var(--danger);border:1px solid var(--border2)}
+          .btn.danger:hover{background:color-mix(in srgb,var(--danger) 10%,transparent);opacity:1}
+          .btn:disabled{opacity:.45;cursor:not-allowed}
 
-            .sidebar-head{
-              display:flex; align-items:center; justify-content:space-between;
-              padding:12px 8px; flex-shrink:0;
-            }
-            .sidebar-icon-btn{
-              width:36px; height:36px; border-radius:var(--radius-md);
-              display:flex; align-items:center; justify-content:center;
-              color:var(--text-primary); transition: background 0.15s ease;
-            }
-            .sidebar-icon-btn:hover{ background: var(--bg-hover); }
+          .turn{margin:14px 0;animation:rise .35s var(--ease)}
+          @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+          .u-bubble{background:var(--user);border-radius:18px;padding:10px 16px;width:fit-content;max-width:88%;margin-left:auto;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
+          .a-body{font-family:var(--serif);font-size:16.5px;line-height:1.72;overflow-wrap:anywhere}
+          .md>*:first-child{margin-top:0}
+          .md p{margin:0 0 14px}
+          .md p:last-child{margin-bottom:0}
+          .md h1,.md h2,.md h3,.md h4{font-family:var(--serif);font-weight:600;line-height:1.3;margin:22px 0 8px}
+          .md h1{font-size:1.45em}.md h2{font-size:1.28em}.md h3{font-size:1.12em}.md h4{font-size:1em}
+          .md ul,.md ol{margin:0 0 14px 1.4em}
+          .md li{margin:4px 0;padding-left:2px}
+          .md li>p{margin:0}
+          .md blockquote{border-left:3px solid var(--border2);padding:2px 0 2px 16px;color:var(--text2);margin:0 0 14px}
+          .md a{color:var(--accent);text-underline-offset:3px}
+          .md hr{border:none;border-top:1px solid var(--border);margin:20px 0}
+          .md strong{font-weight:600}
+          .md :not(pre)>code{font-family:var(--mono);font-size:.84em;background:var(--hover);border:1px solid var(--border);padding:1px 6px;border-radius:6px}
+          .table-wrap{overflow-x:auto;margin:0 0 16px;border:1px solid var(--border);border-radius:12px}
+          .md table{border-collapse:collapse;width:100%;font-family:var(--ui);font-size:14px}
+          .md th,.md td{padding:9px 14px;text-align:left;border-bottom:1px solid var(--border)}
+          .md tr:last-child td{border-bottom:none}
+          .md th{background:var(--hover);font-weight:600}
+          .md .katex-display{overflow-x:auto;overflow-y:hidden;padding:4px 0}
 
-            .brand{ display:flex; align-items:center; gap:8px; font-weight:600; font-size:15px; padding:4px 8px; }
-            .brand-mark{ width:26px; height:26px; border-radius:7px; background: var(--text-primary); display:flex; align-items:center; justify-content:center; }
-            .brand-mark svg{ width:15px; height:15px; stroke:#fff; }
+          .codebox{margin:4px 0 18px;border-radius:12px;overflow:hidden;background:#1d1d1c;border:1px solid #2e2d2b;font-family:var(--mono)}
+          .codebox-head{display:flex;align-items:center;justify-content:space-between;padding:7px 8px 7px 16px;background:#272725;color:#b9b6ab;font-size:12.5px}
+          .codebox-lang{letter-spacing:.02em}
+          .code-btn{display:flex;align-items:center;gap:6px;padding:4px 9px;border-radius:7px;color:#b9b6ab;font:500 12.5px var(--ui);transition:background .15s,color .15s}
+          .code-btn:hover{background:#363633;color:#fff}
+          .code-btn.ok{color:#8ccf9f}
+          .code-btn .i{width:14px;height:14px}
+          .codebox pre{margin:0;padding:14px 16px;overflow-x:auto;background:transparent}
+          .codebox pre code.hljs{display:block;padding:0;background:transparent;font-family:var(--mono);font-size:13.5px;line-height:1.65;color:#d8d6cd;tab-size:4}
 
-            .sidebar-nav{ display:flex; flex-direction:column; gap:1px; padding: 4px 8px 8px 8px; flex-shrink:0; }
-            .nav-row{ display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:var(--radius-md); font-size:14px; color: var(--text-primary); transition: background 0.15s ease; }
-            .nav-row:hover{ background: var(--bg-hover); }
-            .nav-row.active{ background: var(--bg-active); font-weight:500; }
-            .nav-row .icon{ color: var(--text-secondary); }
+          details.think{margin:0 0 14px;border:1px solid var(--border);border-radius:12px;background:var(--surface);font-family:var(--ui)}
+          details.think summary{cursor:pointer;padding:9px 14px;font-size:13.5px;color:var(--text2);list-style:none;display:flex;align-items:center;gap:8px;user-select:none}
+          details.think summary::-webkit-details-marker{display:none}
+          details.think summary::before{content:"";width:6px;height:6px;border-right:1.6px solid var(--text3);border-bottom:1.6px solid var(--text3);transform:rotate(-45deg);transition:transform .2s}
+          details.think[open] summary::before{transform:rotate(45deg)}
+          .think-body{padding:2px 16px 14px;font-size:13.5px;line-height:1.65;color:var(--text2);white-space:pre-wrap;max-height:320px;overflow-y:auto}
 
-            .search-box{ display:flex; align-items:center; gap:10px; margin: 0 8px 4px 8px; padding:9px 10px; border-radius:var(--radius-md); transition: background 0.15s ease; }
-            .search-box:hover{ background: var(--bg-hover); }
-            .search-box input{ border:none; background:transparent; outline:none; font-size:14px; color:var(--text-primary); width:100%; font-family:inherit; }
-            .search-box input::placeholder{ color: var(--text-tertiary); }
+          .caret{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);margin-left:5px;vertical-align:middle;animation:pulse 1s ease-in-out infinite}
+          @keyframes pulse{0%,100%{opacity:.25;transform:scale(.8)}50%{opacity:1;transform:scale(1.1)}}
+          .typing{display:flex;gap:5px;padding:10px 0}
+          .typing i{width:7px;height:7px;border-radius:50%;background:var(--accent);opacity:.3;animation:tdot 1.2s infinite ease-in-out}
+          .typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
+          @keyframes tdot{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}
+          .a-actions{display:flex;gap:2px;margin-top:8px;opacity:0;transition:opacity .2s}
+          .turn:hover .a-actions,.turn.last .a-actions{opacity:1}
+          .a-actions .icon-btn{width:30px;height:30px}
+          .err{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-family:var(--ui);font-size:14px;color:var(--danger);border:1px solid color-mix(in srgb,var(--danger) 35%,transparent);background:color-mix(in srgb,var(--danger) 7%,transparent);padding:10px 14px;border-radius:12px;margin-top:8px}
 
-            .sidebar-scroll{ flex:1; overflow-y:auto; padding: 8px; }
-            .sidebar-scroll::-webkit-scrollbar{ width:6px; }
-            .sidebar-scroll::-webkit-scrollbar-thumb{ background: #d9d9d9; border-radius:3px; }
-            .sidebar-scroll::-webkit-scrollbar-track{ background:transparent; }
+          .composer-wrap{padding:0 24px calc(18px + env(safe-area-inset-bottom,0px));flex-shrink:0}
+          .composer{max-width:760px;margin:0 auto;display:flex;align-items:flex-end;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:10px 10px 10px 20px;box-shadow:var(--shadow);transition:border-color .2s,box-shadow .2s}
+          .composer:focus-within{border-color:var(--border2);box-shadow:0 6px 30px rgba(31,30,29,.09)}
+          #chatInput{flex:1;border:none;outline:none;background:transparent;resize:none;max-height:220px;line-height:1.55;padding:7px 0;font-size:15.5px}
+          #chatInput::placeholder{color:var(--text3)}
+          .send{width:36px;height:36px;border-radius:12px;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;transition:background .15s,transform .15s,opacity .15s;flex-shrink:0}
+          .send:hover:not(:disabled){background:var(--accent-h)}
+          .send:active:not(:disabled){transform:scale(.93)}
+          .send:disabled{opacity:.35;cursor:not-allowed}
+          .send.stop{background:var(--text);color:var(--bg)}
+          .fine{text-align:center;font-size:12px;color:var(--text3);margin-top:9px}
 
-            .section-label{ font-size:12px; font-weight:600; color: var(--text-tertiary); padding: 14px 10px 6px 10px; }
-            .section-label:first-child{ padding-top:4px; }
+          .page{flex:1;overflow-y:auto}
+          .page-in{max-width:960px;margin:0 auto;padding:10px 24px 60px}
+          .h2{font-family:var(--serif);font-size:30px;font-weight:400;letter-spacing:-.01em;margin:6px 0 4px}
+          .lead{color:var(--text2);line-height:1.55;margin-bottom:18px}
+          .card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px}
+          .seg{display:inline-flex;background:var(--hover);border-radius:11px;padding:3px;gap:2px}
+          .seg button{padding:7px 16px;border-radius:9px;color:var(--text2);font-weight:500;font-size:14px;transition:all .15s}
+          .seg button.on{background:var(--surface);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.08)}
+          .row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+          .disk{margin-left:auto;font-size:13px;color:var(--text3)}
+          .sec{font-size:12px;font-weight:600;letter-spacing:.04em;color:var(--text3);text-transform:uppercase;margin:26px 0 10px}
+          .grid{display:grid;gap:10px}
+          .mcard{display:flex;align-items:flex-start;gap:14px;background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:14px 16px;transition:border-color .15s,box-shadow .15s;animation:rise .3s var(--ease)}
+          .mcard:hover{border-color:var(--border2)}
+          .mcard.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+          .mcard-main{flex:1;min-width:0}
+          .mcard-title{font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+          .mcard-sub{font-size:12.5px;color:var(--text3);font-family:var(--mono);margin-top:2px;word-break:break-all}
+          .mcard-desc{font-size:13.5px;color:var(--text2);margin-top:6px;line-height:1.5}
+          .mcard-act{display:flex;gap:8px;flex-shrink:0;align-items:center}
+          .badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent);letter-spacing:.01em}
+          .badge.gray{background:var(--hover);color:var(--text2)}
+          .prog{margin-top:10px}
+          .bar{height:6px;background:var(--hover);border-radius:99px;overflow:hidden}
+          .bar i{display:block;height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .4s var(--ease)}
+          .bar.indet i{width:35%!important;animation:slide 1.2s ease-in-out infinite}
+          @keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
+          .prog-text{font-size:12.5px;color:var(--text3);margin-top:6px;font-variant-numeric:tabular-nums}
+          .prog-err{font-size:12.5px;color:var(--danger);margin-top:6px}
+          .custom{display:flex;gap:8px;margin-top:6px}
+          .custom input,.field input,.field textarea,.field select{width:100%;border:1px solid var(--border);background:var(--bg);border-radius:11px;padding:10px 12px;outline:none;transition:border-color .15s}
+          .custom input:focus,.field input:focus,.field textarea:focus,.field select:focus{border-color:var(--border2)}
+          .empty-note{color:var(--text3);font-size:14px;padding:14px 4px}
 
-            .chat-row{ display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:var(--radius-md); font-size:14px; color: var(--text-primary); cursor:pointer; position:relative; transition: background 0.15s ease; }
-            .chat-row:hover{ background: var(--bg-hover); }
-            .chat-row.active{ background: var(--bg-active); }
-            .chat-row-text{ flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-            .chat-row-del{ opacity:0; width:22px; height:22px; display:flex; align-items:center; justify-content:center; border-radius:6px; color: var(--text-tertiary); flex-shrink:0; }
-            .chat-row:hover .chat-row-del{ opacity:1; }
-            .chat-row-del:hover{ background:#dcdcdc; color:var(--text-primary); }
+          .img-wrap{display:grid;grid-template-columns:340px 1fr;gap:20px;align-items:start}
+          .field{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+          .field label{font-size:12.5px;font-weight:600;color:var(--text2)}
+          .field textarea{resize:vertical;min-height:84px;line-height:1.5}
+          .f3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+          .out{min-height:520px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;background:var(--surface)}
+          .out img{max-width:100%;max-height:72vh;border-radius:12px;animation:rise .5s var(--ease);display:block}
+          .out-empty{text-align:center;color:var(--text3);line-height:1.6;max-width:300px}
+          .out-empty .i{width:38px;height:38px;margin-bottom:12px;stroke-width:1.4}
+          .out-empty b{display:block;color:var(--text2);font-weight:500;margin-bottom:4px}
+          .out-actions{position:absolute;top:12px;right:12px;display:flex;gap:8px}
+          .gen{display:flex;flex-direction:column;align-items:center;gap:16px;width:100%;max-width:300px}
+          .gen-art{width:220px;height:220px;border-radius:20px;position:relative;overflow:hidden;background:linear-gradient(135deg,var(--accent-soft),var(--hover));display:flex;align-items:center;justify-content:center}
+          .gen-art::after{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 30%,rgba(255,255,255,.35) 50%,transparent 70%);background-size:250% 100%;animation:shimmer 1.8s ease-in-out infinite}
+          @keyframes shimmer{0%{background-position:150% 0}100%{background-position:-50% 0}}
+          .gen-art .i{width:54px;height:54px;color:var(--accent);stroke-width:2;animation:spin 5s linear infinite}
+          @keyframes spin{to{transform:rotate(360deg)}}
+          .gen-text{font-weight:500;color:var(--text2);text-align:center}
+          .gen-sub{font-size:12.5px;color:var(--text3);font-variant-numeric:tabular-nums;text-align:center}
+          .gen .bar{width:100%}
+          .hint{font-size:13px;color:var(--text3);line-height:1.5}
+          .hint a,.link{color:var(--accent);cursor:pointer;text-decoration:underline;text-underline-offset:2px}
 
-            .sidebar-foot{ flex-shrink:0; padding:8px; border-top:1px solid var(--border); }
-            .user-row{ display:flex; align-items:center; gap:10px; padding:8px; border-radius:var(--radius-md); transition: background 0.15s ease; }
-            .user-row:hover{ background: var(--bg-hover); }
-            .user-avatar{ width:28px; height:28px; border-radius:50%; background: linear-gradient(135deg,#6a6ad8,#a76ad8); display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; color:#fff; flex-shrink:0; }
-            .user-info{ flex:1; min-width:0; }
-            .user-name{ font-size:13.5px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-            .user-plan{ font-size:12px; color: var(--text-tertiary); }
+          .toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 18px;border-radius:12px;font-size:14px;z-index:200;animation:rise .25s var(--ease);box-shadow:0 8px 30px rgba(0,0,0,.25);max-width:90vw}
 
-            /* ===================== MAIN ===================== */
-            .main{ flex:1; display:flex; flex-direction:column; overflow:hidden; min-width:0; }
-
-            .topbar{ display:flex; align-items:center; gap:8px; padding:10px 12px; flex-shrink:0; }
-            .topbar-left{ display:flex; align-items:center; gap:4px; }
-
-            .model-picker{ display:flex; align-items:center; gap:6px; padding:8px 10px; border-radius:var(--radius-md); font-size:15px; font-weight:600; color: var(--text-primary); transition: background 0.15s ease; }
-            .model-picker:hover{ background: var(--bg-hover); }
-            .model-picker .icon{ color: var(--text-tertiary); width:16px; height:16px; }
-
-            .topbar-right{ margin-left:auto; display:flex; align-items:center; gap:4px; }
-
-            /* ===================== VIEWS ===================== */
-            .views{ flex:1; display:flex; overflow:hidden; min-height:0; }
-            .view{ display:none; flex-direction:column; flex:1; overflow:hidden; }
-            .view.active{ display:flex; }
-
-            /* ---- CHAT ---- */
-            .chat-scroll{ flex:1; overflow-y:auto; }
-            .chat-scroll::-webkit-scrollbar{ width:8px; }
-            .chat-scroll::-webkit-scrollbar-thumb{ background:#d9d9d9; border-radius:4px; }
-            .chat-scroll::-webkit-scrollbar-track{ background:transparent; }
-
-            .chat-inner{ max-width:768px; margin:0 auto; padding: 24px 20px 48px 20px; display:flex; flex-direction:column; }
-
-            .empty-wrap{ flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:20px; padding:24px; }
-            .empty-mark{ width:48px; height:48px; border-radius:12px; background: var(--text-primary); display:flex; align-items:center; justify-content:center; }
-            .empty-mark svg{ width:26px; height:26px; stroke:#fff; }
-            .empty-title{ font-size:28px; font-weight:600; color: var(--text-primary); letter-spacing:-0.01em; }
-
-            .turn{ padding: 20px 0; display:flex; }
-            .turn.user{ justify-content:flex-end; }
-            .turn.assistant{ justify-content:flex-start; }
-
-            .bubble-user{ background: var(--user-bubble); border-radius: 20px; padding: 10px 18px; max-width: 70%; line-height:1.6; font-size:15px; white-space:pre-wrap; word-wrap:break-word; }
-
-            .assistant-row{ display:flex; gap:16px; width:100%; }
-            .assistant-avatar{ width:28px; height:28px; border-radius:50%; background:#10a37f; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
-            .assistant-avatar svg{ width:16px; height:16px; stroke:#fff; }
-
-            .assistant-body{ flex:1; min-width:0; line-height:1.7; font-size:15px; padding-top:3px; }
-            .assistant-body p{ margin-bottom:12px; }
-            .assistant-body p:last-child{ margin-bottom:0; }
-            .assistant-body h1,.assistant-body h2,.assistant-body h3{ margin:16px 0 8px 0; font-weight:600; line-height:1.4; }
-            .assistant-body h1{ font-size:1.3em; }
-            .assistant-body h2{ font-size:1.2em; }
-            .assistant-body h3{ font-size:1.1em; }
-            .assistant-body ul,.assistant-body ol{ margin:10px 0 10px 22px; }
-            .assistant-body li{ margin-bottom:4px; }
-            .assistant-body blockquote{ border-left:3px solid var(--border); padding-left:14px; color:var(--text-secondary); margin:12px 0; }
-            .assistant-body a{ color:var(--text-primary); text-decoration:underline; text-underline-offset:2px; }
-            .assistant-body strong{ font-weight:600; }
-            .assistant-body hr{ border:none; border-top:1px solid var(--border); margin:16px 0; }
-
-            .assistant-body :not(pre) > code{
-              font-family: ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-              background: #f4f4f4;
-              padding:2px 6px; border-radius:5px; font-size:0.88em;
-            }
-
-            .assistant-body table{
-              border-collapse:collapse; width:100%; margin:14px 0; font-size:14px;
-              display:block; overflow-x:auto;
-            }
-            .assistant-body th, .assistant-body td{
-              border:1px solid var(--border); padding:8px 12px; text-align:left;
-            }
-            .assistant-body th{ background:#f7f7f7; font-weight:600; }
-
-            /* ---- CODE BLOCKS ---- */
-            .code-block{
-              margin: 14px 0;
-              border-radius: 12px;
-              overflow: hidden;
-              background: #1e1e1e;
-              border: 1px solid #2d2d2d;
-            }
-            .code-block-head{
-              display:flex; align-items:center; justify-content:space-between;
-              padding: 8px 14px;
-              background: #2a2a2a;
-              font-size: 12.5px;
-              color: #c5c5c5;
-              font-family: ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-            }
-            .code-block-lang{ text-transform:lowercase; letter-spacing:0.02em; }
-            .copy-btn{
-              display:flex; align-items:center; gap:6px;
-              color:#c5c5c5; font-size:12.5px; font-family:inherit;
-              padding:4px 8px; border-radius:6px;
-              transition: background 0.15s ease, color 0.15s ease;
-            }
-            .copy-btn:hover{ background:#3a3a3a; color:#fff; }
-            .copy-btn svg{ width:14px; height:14px; stroke-width:2; }
-            .copy-btn.copied{ color:#10a37f; }
-
-            .code-block pre{
-              margin:0; padding:14px 16px; overflow-x:auto;
-              background: #1e1e1e;
-            }
-            .code-block pre::-webkit-scrollbar{ height:8px; }
-            .code-block pre::-webkit-scrollbar-thumb{ background:#444; border-radius:4px; }
-            .code-block code{
-              background:none; padding:0; color:inherit;
-              font-family: ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-              font-size: 13.5px; line-height:1.6;
-            }
-
-            /* ---- MATH ---- */
-            .katex{ font-size: 1.05em; }
-            .katex-display{ overflow-x:auto; overflow-y:hidden; padding: 4px 0; }
-
-            .typing-row{ display:flex; gap:4px; padding:8px 0; }
-            .typing-dot{ width:6px; height:6px; border-radius:50%; background: var(--text-tertiary); animation: tbounce 1.3s infinite ease-in-out; }
-            .typing-dot:nth-child(2){ animation-delay:0.15s; }
-            .typing-dot:nth-child(3){ animation-delay:0.3s; }
-            @keyframes tbounce{ 0%,80%,100%{ opacity:0.3; transform:translateY(0);} 40%{ opacity:1; transform:translateY(-3px);} }
-
-            /* ---- INPUT ---- */
-            .composer-wrap{ flex-shrink:0; padding: 0 20px 22px 20px; }
-            .composer{ max-width:768px; margin:0 auto; }
-            .composer-box{ display:flex; flex-direction:column; background: var(--bg-input); border:1px solid var(--border); border-radius:26px; box-shadow: 0 2px 10px rgba(0,0,0,0.04); padding: 10px 10px 10px 18px; }
-            .composer-box:focus-within{ border-color:#c9c9c9; }
-            .composer-textrow{ display:flex; align-items:flex-end; gap:8px; }
-            #chatInput{ flex:1; border:none; outline:none; background:transparent; resize:none; max-height:200px; font-family:inherit; font-size:15px; line-height:1.5; color: var(--text-primary); padding:8px 0; }
-            #chatInput::placeholder{ color: var(--text-tertiary); }
-
-            .composer-toolbar{ display:flex; align-items:center; justify-content:space-between; margin-top:4px; }
-            .composer-tools-left{ display:flex; gap:2px; }
-            .tool-btn{ width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; color: var(--text-secondary); transition: background 0.15s ease; }
-            .tool-btn:hover{ background: var(--bg-hover); }
-            .tool-btn.active{ color: var(--accent); background: rgba(16,163,127,0.1); }
-
-            .send-circle{ width:34px; height:34px; border-radius:50%; background: var(--text-primary); display:flex; align-items:center; justify-content:center; color:#fff; transition: background 0.15s ease, opacity 0.15s ease; }
-            .send-circle:hover{ background:#2a2a2a; }
-            .send-circle:disabled{ background:#d9d9d9; cursor:not-allowed; }
-            .send-circle svg{ width:16px; height:16px; stroke-width:2.2; }
-
-            .disclaimer{ text-align:center; font-size:12px; color: var(--text-tertiary); margin-top:10px; }
-
-            /* ---- IMAGE VIEW ---- */
-            #imageView{ overflow-y:auto; }
-            .image-wrap{ max-width:1100px; margin:0 auto; padding:28px 20px 48px 20px; display:grid; grid-template-columns: 320px 1fr; gap:24px; }
-
-            .panel{ border:1px solid var(--border); border-radius:var(--radius-lg); padding:18px; display:flex; flex-direction:column; gap:14px; background:#fff; }
-
-            .field{ display:flex; flex-direction:column; gap:6px; }
-            .field-label{ font-size:12.5px; font-weight:600; color: var(--text-secondary); }
-            .field input, .field textarea{ border:1px solid var(--border); border-radius:var(--radius-md); padding:9px 11px; font-family:inherit; font-size:14px; color: var(--text-primary); background:#fff; transition: border-color 0.15s ease; }
-            .field input:focus, .field textarea:focus{ outline:none; border-color:#8e8ea0; }
-            .field textarea{ resize:vertical; min-height:76px; line-height:1.5; }
-
-            .field-row{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-            .field-row.three{ grid-template-columns:1fr 1fr 1fr; }
-
-            .generate-btn{ width:100%; padding:11px 16px; background: var(--text-primary); color:#fff; border-radius:var(--radius-pill); font-weight:600; font-size:14.5px; display:flex; align-items:center; justify-content:center; gap:8px; transition: background 0.15s ease, opacity 0.15s ease; }
-            .generate-btn:hover:not(:disabled){ background:#2a2a2a; }
-            .generate-btn:disabled{ opacity:0.5; cursor:not-allowed; }
-
-            .output-panel{ border:1px solid var(--border); border-radius:var(--radius-lg); display:flex; align-items:center; justify-content:center; min-height:520px; background:#fafafa; padding:24px; position:relative; overflow:hidden; }
-            .output-panel img{ max-width:100%; max-height:76vh; border-radius:10px; animation: imgReveal 0.5s ease; }
-            @keyframes imgReveal{ from{ opacity:0; transform:scale(0.98); } to{ opacity:1; transform:scale(1); } }
-
-            .output-empty{ text-align:center; color: var(--text-tertiary); }
-            .output-empty-icon{ width:40px; height:40px; margin:0 auto 14px auto; color: var(--text-tertiary); }
-            .output-empty-title{ font-size:15px; font-weight:500; color: var(--text-secondary); margin-bottom:6px; }
-            .output-empty-sub{ font-size:13.5px; line-height:1.6; }
-
-            /* ---- GENERATING ANIMATION ---- */
-            .gen-loader{
-              display:flex; flex-direction:column; align-items:center; gap:18px;
-              width:100%; max-width:320px;
-            }
-            .gen-canvas-wrap{
-              width:220px; height:220px; border-radius:16px;
-              position:relative; overflow:hidden;
-              background: linear-gradient(135deg, #efe9ff, #e8f7f2);
-            }
-            .gen-sweep{
-              position:absolute; inset:0;
-              background: linear-gradient(100deg,
-                transparent 20%,
-                rgba(255,255,255,0.75) 45%,
-                rgba(255,255,255,0.75) 55%,
-                transparent 80%);
-              background-size: 250% 100%;
-              animation: sweep 2.1s ease-in-out infinite;
-              mix-blend-mode: screen;
-            }
-            @keyframes sweep{
-              0%{ background-position: 150% 0; }
-              100%{ background-position: -50% 0; }
-            }
-            .gen-noise-grid{
-              position:absolute; inset:0;
-              display:grid;
-              grid-template-columns: repeat(10, 1fr);
-              grid-template-rows: repeat(10, 1fr);
-              gap:2px;
-              padding:2px;
-            }
-            .gen-noise-grid span{
-              border-radius:3px;
-              background: linear-gradient(135deg, #8b5cf6, #10a37f);
-              opacity:0.12;
-              animation: noiseFlicker 1.8s ease-in-out infinite;
-            }
-            @keyframes noiseFlicker{
-              0%,100%{ opacity:0.08; }
-              50%{ opacity:0.32; }
-            }
-            .gen-ring{
-              position:absolute;
-              top:50%; left:50%;
-              width:56px; height:56px;
-              margin:-28px 0 0 -28px;
-              border-radius:50%;
-              border: 3px solid rgba(13,13,13,0.08);
-              border-top-color: var(--text-primary);
-              animation: spin 0.9s linear infinite;
-            }
-            @keyframes spin{ to{ transform:rotate(360deg); } }
-
-            .gen-status-text{ font-size:14.5px; font-weight:500; color: var(--text-secondary); text-align:center; }
-            .gen-progress-track{
-              width:100%; height:6px; border-radius:999px;
-              background:#eceef0; overflow:hidden;
-            }
-            .gen-progress-fill{
-              height:100%; border-radius:999px;
-              background: linear-gradient(90deg, #8b5cf6, #10a37f);
-              width:0%;
-              transition: width 0.4s ease;
-            }
-            .gen-eta{ font-size:12.5px; color: var(--text-tertiary); }
-
-            .spinner{ width:36px; height:36px; border:3px solid var(--border); border-top-color: var(--text-primary); border-radius:50%; animation: spin 0.9s linear infinite; margin:0 auto 16px auto; }
-
-            /* ===================== RESPONSIVE ===================== */
-            @media (max-width: 1024px){
-              .sidebar{ position:absolute; height:100%; z-index:1000; box-shadow: 2px 0 16px rgba(0,0,0,0.08); }
-              .sidebar.collapsed{ width:0; }
-              .image-wrap{ grid-template-columns:1fr; }
-              .bubble-user{ max-width:85%; }
-            }
-            @media (max-width: 640px){
-              .chat-inner{ padding:16px 14px 40px 14px; }
-              .composer-wrap{ padding:0 12px 16px 12px; }
-              .field-row, .field-row.three{ grid-template-columns:1fr; }
-              .bubble-user{ max-width:92%; }
-            }
+          @media (max-width:860px){
+            .sidebar{position:fixed;top:0;bottom:0;left:0;transform:translateX(-100%);margin-left:0!important;box-shadow:none}
+            body.sb-open .sidebar{transform:none;box-shadow:8px 0 40px rgba(0,0,0,.2)}
+            .scrim{display:block;position:fixed;inset:0;background:rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:opacity .3s;z-index:40}
+            body.sb-open .scrim{opacity:1;pointer-events:auto}
+            .img-wrap{grid-template-columns:1fr}
+            .chat-col,.page-in{padding-left:16px;padding-right:16px}
+            .composer-wrap{padding-left:12px;padding-right:12px}
+            .mcard{flex-direction:column}
+            .mcard-act{width:100%}
+            .mcard-act .btn{flex:1}
+          }
+          @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
           </style>
           </head>
           <body>
 
-          <!-- ===================== SIDEBAR ===================== -->
-          <div class="sidebar" id="sidebar">
-            <div class="sidebar-head">
-              <div class="brand">
-                <div class="brand-mark">
-                  <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+          <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+            <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6L5.6 18.4"/></symbol>
+            <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+            <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L3 21l1.9-5.4A8 8 0 1 1 21 12z"/></symbol>
+            <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></symbol>
+            <symbol id="i-cube" viewBox="0 0 24 24"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 22V12M21 7l-9 5-9-5"/></symbol>
+            <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></symbol>
+            <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+            <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+            <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></symbol>
+            <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+            <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></symbol>
+            <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></symbol>
+            <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2.5" fill="currentColor"/></symbol>
+            <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+            <symbol id="i-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+            <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+            <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></symbol>
+          </svg>
+
+          <aside class="sidebar" id="sidebar">
+            <div class="sb-top">
+              <div class="brand"><svg class="i"><use href="#i-spark"/></svg><span>Unified AI</span></div>
+              <button class="icon-btn" data-act="toggle-sb" title="Close sidebar"><svg class="i"><use href="#i-panel"/></svg></button>
+            </div>
+            <button class="new-chat" data-act="new-chat"><svg class="i"><use href="#i-plus"/></svg><span>New chat</span></button>
+            <nav class="nav">
+              <button class="nav-item active" data-view="chat"><svg class="i"><use href="#i-chat"/></svg>Chat</button>
+              <button class="nav-item" data-view="image"><svg class="i"><use href="#i-image"/></svg>Images</button>
+              <button class="nav-item" data-view="models"><svg class="i"><use href="#i-cube"/></svg>Models</button>
+            </nav>
+            <div class="sb-search"><input id="search" type="text" placeholder="Search chats" autocomplete="off"></div>
+            <div class="sb-list" id="convList"></div>
+            <div class="sb-foot">
+              <div class="status"><span class="dot" id="dot"></span><span id="statusText">Connecting…</span></div>
+              <button class="icon-btn" data-act="theme" title="Toggle theme"><svg class="i" id="themeIcon"><use href="#i-moon"/></svg></button>
+            </div>
+          </aside>
+          <div class="scrim" data-act="toggle-sb"></div>
+
+          <main class="main">
+            <header class="topbar">
+              <button class="icon-btn" id="sbOpen" data-act="toggle-sb" title="Toggle sidebar"><svg class="i"><use href="#i-panel"/></svg></button>
+              <div class="model-wrap" id="pillWrap">
+                <button class="pill" id="modelPill" data-act="model-menu"><span id="modelPillText">No model installed</span><svg class="i"><use href="#i-chev"/></svg></button>
+                <div class="menu" id="modelMenu" hidden></div>
+              </div>
+              <div class="topbar-title" id="viewTitle" hidden></div>
+              <div class="spacer"></div>
+            </header>
+
+            <section class="view active" id="view-chat">
+              <div class="chat-scroll" id="chatScroll"><div class="chat-col" id="chatCol"></div></div>
+              <div class="composer-wrap">
+                <div class="composer">
+                  <textarea id="chatInput" rows="1" placeholder="How can I help you today?"></textarea>
+                  <button class="send" id="sendBtn" data-act="send" title="Send" disabled><svg class="i" id="sendIcon"><use href="#i-up"/></svg></button>
                 </div>
-                <span>Unified AI</span>
+                <div class="fine">Runs on a self-hosted model and can make mistakes. Markdown, code and LaTeX are supported.</div>
               </div>
-              <button class="sidebar-icon-btn" onclick="toggleSidebar()" title="Close sidebar">
-                <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></svg>
-              </button>
-            </div>
+            </section>
 
-            <div class="sidebar-nav">
-              <div class="nav-row" onclick="newChat()">
-                <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-                <span>New chat</span>
-              </div>
-              <div class="nav-row active" data-view="chat" onclick="switchView('chat')">
-                <svg class="icon" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                <span>Chat</span>
-              </div>
-              <div class="nav-row" data-view="image" onclick="switchView('image')">
-                <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
-                <span>Image generation</span>
-              </div>
-            </div>
-
-            <div class="search-box">
-              <svg class="icon icon-sm" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-              <input type="text" placeholder="Search chats" id="searchInput" oninput="filterChats(this.value)">
-            </div>
-
-            <div class="sidebar-scroll">
-              <div id="todaySection" style="display:none">
-                <div class="section-label">Today</div>
-                <div id="todayChats"></div>
-              </div>
-              <div id="previousSection" style="display:none">
-                <div class="section-label">Previous 7 days</div>
-                <div id="previousChats"></div>
-              </div>
-              <div id="olderSection" style="display:none">
-                <div class="section-label">Older</div>
-                <div id="olderChats"></div>
-              </div>
-            </div>
-
-            <div class="sidebar-foot">
-              <div class="user-row">
-                <div class="user-avatar">U</div>
-                <div class="user-info">
-                  <div class="user-name">Operator</div>
-                  <div class="user-plan">Self-hosted</div>
-                </div>
-                <svg class="icon icon-sm" viewBox="0 0 24 24" style="color:var(--text-tertiary)"><circle cx="12" cy="5" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="12" cy="19" r="1.2"/></svg>
-              </div>
-            </div>
-          </div>
-
-          <!-- ===================== MAIN ===================== -->
-          <div class="main">
-            <div class="topbar">
-              <div class="topbar-left">
-                <button class="sidebar-icon-btn" id="sidebarOpenBtn" onclick="toggleSidebar()" title="Open sidebar" style="display:none">
-                  <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></svg>
-                </button>
-                <div class="model-picker" onclick="alert('Only Qwen2.5-7B-Instruct is configured for this deployment.')">
-                  <span id="modelLabel">Qwen2.5 7B Instruct</span>
-                  <svg class="icon" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
-                </div>
-              </div>
-              <div class="topbar-right">
-                <button class="sidebar-icon-btn" title="New chat" onclick="newChat()">
-                  <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-                </button>
-              </div>
-            </div>
-
-            <div class="views">
-              <!-- ===================== CHAT VIEW ===================== -->
-              <div id="chatView" class="view active">
-                <div class="chat-scroll" id="chatScroll">
-                  <div class="chat-inner" id="chatInner">
-                    <div class="empty-wrap" id="emptyState">
-                      <div class="empty-mark">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
-                      </div>
-                      <div class="empty-title">What can I help with?</div>
+            <section class="view" id="view-image">
+              <div class="page"><div class="page-in">
+                <h2 class="h2">Image generation</h2>
+                <p class="lead">Runs on the CPU, so expect a minute or two per image. Distilled models like SD-Turbo are much faster.</p>
+                <div class="img-wrap">
+                  <div class="card">
+                    <div class="field"><label>Model</label>
+                      <select id="imgModel"></select>
+                      <div class="hint" id="imgModelHint"></div>
                     </div>
+                    <div class="field"><label>Prompt</label><textarea id="imgPrompt" placeholder="Describe what you want to see…">A cozy reading nook by a rainy window, warm lamp light, detailed, cinematic</textarea></div>
+                    <div class="field"><label>Negative prompt</label><textarea id="imgNeg" style="min-height:56px" placeholder="What to avoid (optional)"></textarea></div>
+                    <div class="field"><label>Size</label>
+                      <select id="imgSize">
+                        <option value="512x512">512 × 512 · Square</option>
+                        <option value="384x384">384 × 384 · Small, fastest</option>
+                        <option value="512x768">512 × 768 · Portrait</option>
+                        <option value="768x512">768 × 512 · Landscape</option>
+                        <option value="768x768">768 × 768 · Large, slow</option>
+                      </select>
+                    </div>
+                    <div class="f3">
+                      <div class="field"><label>Steps</label><input type="number" id="imgSteps" value="15" min="1" max="50"></div>
+                      <div class="field"><label>CFG</label><input type="number" id="imgCfg" value="7.5" min="0" max="20" step="0.5"></div>
+                      <div class="field"><label>Seed</label><input type="number" id="imgSeed" value="-1"></div>
+                    </div>
+                    <button class="btn accent" id="genBtn" data-act="generate" style="width:100%;padding:12px"><svg class="i sm"><use href="#i-spark"/></svg><span>Generate</span></button>
+                  </div>
+                  <div class="card out" id="imgOut">
+                    <div class="out-empty"><svg class="i"><use href="#i-image"/></svg><b>Your image will appear here</b>Pick a model, write a prompt and press Generate.</div>
                   </div>
                 </div>
+              </div></div>
+            </section>
 
-                <div class="composer-wrap">
-                  <div class="composer">
-                    <div class="composer-box">
-                      <div class="composer-textrow">
-                        <textarea id="chatInput" placeholder="Message the assistant..." rows="1"></textarea>
-                      </div>
-                      <div class="composer-toolbar">
-                        <div class="composer-tools-left">
-                          <button class="tool-btn" title="Attach" onclick="alert('Attachments are not wired up in this deployment.')">
-                            <svg class="icon" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-                          </button>
-                        </div>
-                        <button class="send-circle" id="sendBtn" onclick="sendMessage()" title="Send">
-                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
-                        </button>
-                      </div>
-                    </div>
-                    <div class="disclaimer">Responses are generated by a self-hosted model and may be inaccurate. Supports Markdown, code blocks, tables, and LaTeX math.</div>
-                  </div>
+            <section class="view" id="view-models">
+              <div class="page"><div class="page-in">
+                <h2 class="h2">Models</h2>
+                <p class="lead">Nothing is downloaded until you ask. Install what you need, then pick it from the model menu.</p>
+                <div class="row">
+                  <div class="seg"><button id="tabChat" class="on" data-tab="chat">Language</button><button id="tabImage" data-tab="image">Image</button></div>
+                  <div class="disk" id="diskInfo"></div>
                 </div>
-              </div>
-
-              <!-- ===================== IMAGE VIEW ===================== -->
-              <div id="imageView" class="view">
-                <div class="image-wrap">
-                  <div class="panel">
-                    <div class="field">
-                      <label class="field-label">Prompt</label>
-                      <textarea id="imgPrompt" placeholder="Describe what you want to generate...">A cozy reading nook by a rainy window, warm lamp light, detailed, cinematic</textarea>
-                    </div>
-
-                    <div class="field">
-                      <label class="field-label">Negative prompt</label>
-                      <textarea id="imgNeg" placeholder="What to avoid (optional)"></textarea>
-                    </div>
-
-                    <div class="field-row">
-                      <div class="field">
-                        <label class="field-label">Width</label>
-                        <input type="number" id="imgW" value="512" min="256" max="1024" step="64">
-                      </div>
-                      <div class="field">
-                        <label class="field-label">Height</label>
-                        <input type="number" id="imgH" value="512" min="256" max="1024" step="64">
-                      </div>
-                    </div>
-
-                    <div class="field-row three">
-                      <div class="field">
-                        <label class="field-label">Steps</label>
-                        <input type="number" id="imgSteps" value="15" min="4" max="30">
-                      </div>
-                      <div class="field">
-                        <label class="field-label">CFG</label>
-                        <input type="number" id="imgCfg" value="7.5" min="1" max="15" step="0.5">
-                      </div>
-                      <div class="field">
-                        <label class="field-label">Seed</label>
-                        <input type="number" id="imgSeed" value="-1">
-                      </div>
-                    </div>
-
-                    <button class="generate-btn" id="generateBtn" onclick="generateImage()">
-                      <svg class="icon icon-sm" viewBox="0 0 24 24" stroke="white"><path d="M12 2l1.8 5.6L19.5 9l-5.7 1.4L12 16l-1.8-5.6L4.5 9l5.7-1.4z"/></svg>
-                      <span>Generate image</span>
-                    </button>
-                  </div>
-
-                  <div class="output-panel" id="imgOutput">
-                    <div class="output-empty">
-                      <svg class="output-empty-icon icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
-                      <div class="output-empty-title">Your image will appear here</div>
-                      <div class="output-empty-sub">Set a prompt and generation settings,<br>then generate.</div>
-                    </div>
-                  </div>
+                <div id="modelLists"></div>
+                <div class="sec" id="customLabel">Install by name</div>
+                <div class="custom">
+                  <input id="customInput" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. llama3.2:3b">
+                  <button class="btn" data-act="custom-install">Install</button>
                 </div>
-              </div>
-            </div>
-          </div>
+                <div class="hint" id="customHint" style="margin-top:8px"></div>
+              </div></div>
+            </section>
+          </main>
 
           <script>
-          const CHAT_MODEL = "qwen2.5:7b-instruct";
-          const SYSTEM_PROMPT = "You are a helpful, knowledgeable assistant. Provide clear, accurate responses. Use Markdown formatting (headings, lists, tables, bold/italic) where it helps readability. Wrap code in fenced code blocks with a language tag. Use LaTeX ($...$ for inline, $$...$$ for display) for math.";
+          (() => {
+          'use strict';
 
-          let chatHistory = [];
-          let currentConversationId = null;
-          let conversations = JSON.parse(localStorage.getItem('conversations') || '[]');
+          const SYSTEM_PROMPT = "You are a helpful, knowledgeable assistant. Give clear, accurate answers. Use Markdown (headings, lists, tables, bold) when it helps readability. Always put code in fenced code blocks with a language tag. Use LaTeX with $...$ for inline math and $$...$$ for display math.";
 
-          marked.setOptions({ breaks: true, gfm: true });
-
-          function escapeHtml(s){
-            const d = document.createElement('div');
-            d.textContent = s;
-            return d.innerHTML;
-          }
-
-          const renderer = new marked.Renderer();
-
-          // -----------------------------------------------------------------
-          // FIX: marked v5+ passes a single token object { text, lang, escaped }
-          // to renderer.code, whereas v4 passed positional args
-          // (code, infostring, escaped). The old handler coerced that object
-          // to a string, which is why the code block rendered as
-          // "[object Object]". We now detect the shape and handle both.
-          // -----------------------------------------------------------------
-          renderer.code = function(tokenOrCode, infostring){
-            let code, lang;
-            if (tokenOrCode && typeof tokenOrCode === 'object'){
-              code = tokenOrCode.text != null ? String(tokenOrCode.text) : '';
-              lang = String(tokenOrCode.lang || '').trim().split(/\s+/)[0] || '';
-            } else {
-              code = tokenOrCode != null ? String(tokenOrCode) : '';
-              lang = String(infostring || '').trim().split(/\s+/)[0] || '';
-            }
-
-            let highlighted;
-            try{
-              if (lang && hljs.getLanguage(lang)){
-                highlighted = hljs.highlight(code, { language: lang }).value;
-              } else {
-                highlighted = hljs.highlightAuto(code).value;
-              }
-            } catch(e){
-              highlighted = escapeHtml(code);
-            }
-
-            const id = 'code_' + Math.random().toString(36).slice(2, 10);
-            const label = lang || 'text';
-            return `<div class="code-block">
-              <div class="code-block-head">
-                <span class="code-block-lang">${escapeHtml(label)}</span>
-                <button class="copy-btn" onclick="copyCode('${id}', this)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                  <span>Copy</span>
-                </button>
-              </div>
-              <pre><code id="${id}" class="hljs language-${escapeHtml(label)}">${highlighted}</code></pre>
-            </div>`;
-          };
-          marked.use({ renderer });
-
-          function copyCode(id, btn){
-            const codeEl = document.getElementById(id);
-            if (!codeEl) return;
-            const text = codeEl.innerText;
-            navigator.clipboard.writeText(text).then(() => {
-              const original = btn.innerHTML;
-              btn.classList.add('copied');
-              btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Copied</span>`;
-              setTimeout(() => { btn.classList.remove('copied'); btn.innerHTML = original; }, 1800);
-            });
-          }
-
-          function renderMarkdown(raw){
-            const html = marked.parse(raw || '');
-            return DOMPurify.sanitize(html, { ADD_TAGS: ['svg','path','rect','circle','polyline','line'], ADD_ATTR: ['viewBox','stroke-width','stroke-linecap','stroke-linejoin','d','x','y','rx','ry','cx','cy','r','points','x1','y1','x2','y2'] });
-          }
-
-          function renderMathIn(el){
-            if (!window.renderMathInElement) return;
-            try{
-              renderMathInElement(el, {
-                delimiters: [
-                  { left: '$$', right: '$$', display: true },
-                  { left: '\\[', right: '\\]', display: true },
-                  { left: '$', right: '$', display: false },
-                  { left: '\\(', right: '\\)', display: false }
-                ],
-                throwOnError: false
-              });
-            } catch(e){}
-          }
-
-          function toggleSidebar(){
-            const sb = document.getElementById('sidebar');
-            const openBtn = document.getElementById('sidebarOpenBtn');
-            sb.classList.toggle('collapsed');
-            openBtn.style.display = sb.classList.contains('collapsed') ? 'flex' : 'none';
-          }
-
-          function switchView(name){
-            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-            document.getElementById(name + 'View').classList.add('active');
-            document.querySelectorAll('.nav-row[data-view]').forEach(r => r.classList.toggle('active', r.dataset.view === name));
-            if (name === 'chat') setTimeout(() => document.getElementById('chatInput').focus(), 0);
-          }
-
-          function loadChatHistory(filter){
-            const today = document.getElementById('todayChats');
-            const previous = document.getElementById('previousChats');
-            const older = document.getElementById('olderChats');
-            today.innerHTML = ''; previous.innerHTML = ''; older.innerHTML = '';
-
-            const now = new Date();
-            const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-            const weekAgo = new Date(todayStart.getTime() - 7*24*60*60*1000);
-
-            conversations.forEach(conv => {
-              if (filter && !(conv.title||'').toLowerCase().includes(filter.toLowerCase())) return;
-              const d = new Date(conv.timestamp);
-              const dStart = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-              let bucket = older;
-              if (dStart.getTime() === todayStart.getTime()) bucket = today;
-              else if (d >= weekAgo) bucket = previous;
-
-              const row = document.createElement('div');
-              row.className = 'chat-row' + (conv.id === currentConversationId ? ' active' : '');
-              row.dataset.id = conv.id;
-              row.innerHTML = `
-                <div class="chat-row-text">${escapeHtml(conv.title || 'Untitled')}</div>
-                <div class="chat-row-del" onclick="deleteConversation(event,'${conv.id}')">
-                  <svg class="icon icon-sm" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
-                </div>
-              `;
-              row.onclick = (e) => { if (!e.target.closest('.chat-row-del')) switchConversation(conv.id); };
-              bucket.appendChild(row);
-            });
-
-            document.getElementById('todaySection').style.display = today.children.length ? 'block' : 'none';
-            document.getElementById('previousSection').style.display = previous.children.length ? 'block' : 'none';
-            document.getElementById('olderSection').style.display = older.children.length ? 'block' : 'none';
-          }
-
-          function filterChats(v){ loadChatHistory(v); }
-
-          function switchConversation(id){
-            currentConversationId = id;
-            const conv = conversations.find(c => c.id === id);
-            if (conv){
-              chatHistory = conv.messages;
-              renderMessages();
-              switchView('chat');
-              loadChatHistory();
-            }
-          }
-
-          function deleteConversation(e, id){
-            e.stopPropagation();
-            conversations = conversations.filter(c => c.id !== id);
-            localStorage.setItem('conversations', JSON.stringify(conversations));
-            if (currentConversationId === id) newChat();
-            loadChatHistory();
-          }
-
-          function newChat(){
-            chatHistory = [];
-            currentConversationId = null;
-            renderMessages();
-            switchView('chat');
-            document.getElementById('chatInput').value = '';
-            document.getElementById('chatInput').focus();
-            loadChatHistory();
-          }
-
-          const chatInner = document.getElementById('chatInner');
-          const emptyState = document.getElementById('emptyState');
-          const chatScroll = document.getElementById('chatScroll');
-          const chatInput = document.getElementById('chatInput');
-          const sendBtn = document.getElementById('sendBtn');
-
-          function scrollToBottom(){ chatScroll.scrollTop = chatScroll.scrollHeight; }
-
-          function renderMessages(){
-            chatInner.innerHTML = '';
-            if (chatHistory.length === 0){
-              chatInner.appendChild(emptyState);
-              return;
-            }
-            chatHistory.forEach(msg => appendTurn(msg.role, msg.content));
-            scrollToBottom();
-          }
-
-          function appendTurn(role, content){
-            const turn = document.createElement('div');
-            turn.className = 'turn ' + (role === 'user' ? 'user' : 'assistant');
-
-            if (role === 'user'){
-              const bubble = document.createElement('div');
-              bubble.className = 'bubble-user';
-              bubble.textContent = content;
-              turn.appendChild(bubble);
-            } else {
-              const row = document.createElement('div');
-              row.className = 'assistant-row';
-              row.innerHTML = `
-                <div class="assistant-avatar">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
-                </div>
-                <div class="assistant-body">${renderMarkdown(content || '')}</div>
-              `;
-              turn.appendChild(row);
-              renderMathIn(row.querySelector('.assistant-body'));
-            }
-            chatInner.appendChild(turn);
-            return turn;
-          }
-
-          chatInput.addEventListener('input', function(){
-            this.style.height = 'auto';
-            this.style.height = Math.min(this.scrollHeight, 200) + 'px';
-          });
-          chatInput.addEventListener('keydown', e => {
-            if (e.key === 'Enter' && !e.shiftKey){
-              e.preventDefault();
-              sendMessage();
-            }
-          });
-
-          async function sendMessage(){
-            const text = chatInput.value.trim();
-            if (!text || sendBtn.disabled) return;
-
-            if (chatHistory.length === 0) chatInner.innerHTML = '';
-
-            appendTurn('user', text);
-            chatHistory.push({ role:'user', content:text });
-            chatInput.value = '';
-            chatInput.style.height = 'auto';
-            sendBtn.disabled = true;
-            scrollToBottom();
-
-            const aiTurn = appendTurn('assistant', '');
-            const bodyEl = aiTurn.querySelector('.assistant-body');
-            bodyEl.innerHTML = '<div class="typing-row"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>';
-            scrollToBottom();
-
-            let fullResponse = '';
-            try {
-              const messages = [{ role:'system', content: SYSTEM_PROMPT }, ...chatHistory];
-              const res = await fetch('/api/chat', {
-                method:'POST',
-                headers: { 'Content-Type':'application/json' },
-                body: JSON.stringify({ model: CHAT_MODEL, messages, stream:true })
-              });
-              if (!res.ok) throw new Error('HTTP ' + res.status);
-
-              const reader = res.body.getReader();
-              const decoder = new TextDecoder();
-              let lastRender = 0;
-
-              while (true){
-                const { done, value } = await reader.read();
-                if (done) break;
-                const chunk = decoder.decode(value, { stream:true });
-                for (const line of chunk.split('\n').filter(l => l.trim())){
-                  try {
-                    const parsed = JSON.parse(line);
-                    if (parsed.message && parsed.message.content){
-                      fullResponse += parsed.message.content;
-                      const now = Date.now();
-                      if (now - lastRender > 60){
-                        bodyEl.innerHTML = renderMarkdown(fullResponse);
-                        scrollToBottom();
-                        lastRender = now;
-                      }
-                    }
-                  } catch(e){}
-                }
-              }
-              bodyEl.innerHTML = renderMarkdown(fullResponse);
-              renderMathIn(bodyEl);
-              scrollToBottom();
-              chatHistory.push({ role:'assistant', content: fullResponse });
-            } catch(err){
-              bodyEl.innerHTML = '<span style="color:#d93025">Error: ' + escapeHtml(err.message) + '</span>';
-            } finally {
-              sendBtn.disabled = false;
-              chatInput.focus();
-              saveConversation();
-            }
-          }
-
-          function saveConversation(){
-            if (!currentConversationId){
-              currentConversationId = Date.now().toString();
-              const userMsg = chatHistory.find(m => m.role === 'user');
-              const title = userMsg ? userMsg.content.substring(0,36) : 'New chat';
-              conversations.unshift({ id: currentConversationId, title, messages: chatHistory, timestamp: new Date().toISOString() });
-            } else {
-              const conv = conversations.find(c => c.id === currentConversationId);
-              if (conv) conv.messages = chatHistory;
-            }
-            localStorage.setItem('conversations', JSON.stringify(conversations));
-            loadChatHistory();
-          }
-
-          /* ---------- image generation ---------- */
-          const GEN_STATUS_MESSAGES = [
-            'Submitting job...',
-            'Running on the CPU inference engine...',
-            'Still working - CPU diffusion is slow, this can take several minutes...',
-            'Still working - thanks for your patience...'
+          const OLLAMA_LIBRARY = [
+            { tag:'qwen2.5:7b-instruct', name:'Qwen2.5 7B Instruct', size:4.7, badges:['Recommended'], desc:'Strong all-rounder. A great default for this runner.' },
+            { tag:'qwen2.5:3b-instruct', name:'Qwen2.5 3B Instruct', size:1.9, badges:['Fast'], desc:'Noticeably quicker on CPU, still very capable.' },
+            { tag:'qwen2.5:1.5b-instruct', name:'Qwen2.5 1.5B Instruct', size:1.0, badges:['Fastest'], desc:'Tiny and instant. Good for quick tasks.' },
+            { tag:'qwen2.5-coder:7b', name:'Qwen2.5 Coder 7B', size:4.7, badges:['Code'], desc:'Tuned for programming, debugging and code review.' },
+            { tag:'qwen3:8b', name:'Qwen3 8B', size:5.2, badges:['Reasoning'], desc:'Newer generation with optional step-by-step thinking.' },
+            { tag:'qwen3:4b', name:'Qwen3 4B', size:2.5, badges:['Reasoning','Fast'], desc:'Compact reasoning model.' },
+            { tag:'llama3.2:3b', name:'Llama 3.2 3B', size:2.0, badges:['Fast'], desc:'Meta\u2019s small and speedy general model.' },
+            { tag:'llama3.2:1b', name:'Llama 3.2 1B', size:1.3, badges:['Fastest'], desc:'Smallest Llama. Runs almost anywhere.' },
+            { tag:'llama3.1:8b', name:'Llama 3.1 8B', size:4.9, badges:[], desc:'Well-rounded 8B with long context.' },
+            { tag:'gemma3:4b', name:'Gemma 3 4B', size:3.3, badges:[], desc:'Google\u2019s efficient multilingual model.' },
+            { tag:'gemma3:1b', name:'Gemma 3 1B', size:0.8, badges:['Fastest'], desc:'Very small, great for short answers.' },
+            { tag:'mistral:7b', name:'Mistral 7B', size:4.1, badges:[], desc:'Reliable classic, concise answers.' },
+            { tag:'phi3.5', name:'Phi 3.5 Mini', size:2.2, badges:['Fast'], desc:'Microsoft\u2019s small model, strong at reasoning for its size.' },
+            { tag:'deepseek-r1:7b', name:'DeepSeek R1 7B', size:4.7, badges:['Reasoning'], desc:'Shows its thinking before answering. Slower, more careful.' },
+            { tag:'deepseek-r1:1.5b', name:'DeepSeek R1 1.5B', size:1.1, badges:['Reasoning','Fastest'], desc:'Smallest reasoning model.' },
           ];
 
-          const GEN_GIVEUP_MS = 15 * 60 * 1000;
+          const SUGGESTIONS = [
+            'Explain how transformers work',
+            'Write a Python script to rename files',
+            'Summarize the pros and cons of Rust',
+            'Solve x² − 5x + 6 = 0 step by step'
+          ];
 
-          let genInterval = null;
-          let genStartTime = null;
-          let genPollTimer = null;
-          let genGiveupTimer = null;
+          const $ = (s, r=document) => r.querySelector(s);
+          const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+          const store = {
+            get(k, d){ try{ const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); }catch(e){ return d; } },
+            set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+          };
+          function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+          function icon(name, cls){ return `<svg class="i ${cls||''}"><use href="#i-${name}"/></svg>`; }
+          function fmtBytes(n){ if(!n) return '0 MB'; return n >= 1e9 ? (n/1e9).toFixed(2) + ' GB' : (n/1e6).toFixed(0) + ' MB'; }
+          function fmtDur(s){ s = Math.max(0, Math.round(s)); const m = Math.floor(s/60); return m ? `${m}m ${s%60}s` : `${s}s`; }
+          function toast(msg){
+            const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg;
+            document.body.appendChild(t); setTimeout(() => t.remove(), 3200);
+          }
+          async function copyText(text){
+            try{ await navigator.clipboard.writeText(text); return true; }catch(e){}
+            try{
+              const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
+              document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok;
+            }catch(e){ return false; }
+          }
+          async function jfetch(url, opts){
+            const r = await fetch(url, opts);
+            let d = null; try{ d = await r.json(); }catch(e){}
+            if(!r.ok) throw new Error((d && (d.error || d.detail)) || ('HTTP ' + r.status));
+            return d;
+          }
+          const JSON_H = { 'Content-Type':'application/json' };
 
-          function fmtElapsed(ms){
-            const s = Math.floor(ms / 1000);
-            const m = Math.floor(s / 60);
-            const r = s % 60;
-            return m > 0 ? `${m}m ${r}s` : `${r}s`;
+          const S = {
+            view:'chat', tab:'chat',
+            chatModel: store.get('ua_chat_model',''), imageModel: store.get('ua_image_model',''),
+            installedChat:[], ollamaOk:false,
+            imgCatalog:[], imgInstalled:[], imgInstalls:{}, imgOk:false, diskFree:null,
+            pulls:{},
+            convs: store.get('ua_convs', []), curId:null, history:[],
+            streaming:false, abort:null, stick:true, genBusy:false
+          };
+
+          function applyTheme(t){
+            document.documentElement.dataset.theme = t;
+            $('#themeIcon use').setAttribute('href', t === 'dark' ? '#i-sun' : '#i-moon');
+          }
+          applyTheme(store.get('ua_theme', matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+          const mobile = () => matchMedia('(max-width:860px)').matches;
+          function toggleSidebar(){ document.body.classList.toggle(mobile() ? 'sb-open' : 'sb-collapsed'); }
+          if(mobile()) document.body.classList.remove('sb-open');
+
+          function showView(name){
+            S.view = name;
+            $$('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
+            $$('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === name));
+            $('#pillWrap').hidden = name !== 'chat';
+            const tt = $('#viewTitle'); tt.hidden = name === 'chat';
+            tt.textContent = name === 'image' ? 'Images' : name === 'models' ? 'Models' : '';
+            document.body.classList.remove('sb-open');
+            closeMenu();
+            if(name === 'models'){ refreshAll(); renderModels(); }
+            if(name === 'image'){ refreshImage(); }
+            if(name === 'chat') setTimeout(() => $('#chatInput').focus(), 50);
           }
 
-          function buildGenLoader(){
-            let cells = '';
-            for (let i = 0; i < 100; i++){
-              cells += `<span style="animation-delay:${(i % 10) * 0.07}s"></span>`;
+          const HAS_MD = !!(window.marked && window.DOMPurify);
+          if(HAS_MD){
+            try{ marked.setOptions({ gfm:true, breaks:false, headerIds:false, mangle:false }); }catch(e){}
+            DOMPurify.addHook('afterSanitizeAttributes', n => {
+              if(n.tagName === 'A'){ n.setAttribute('target','_blank'); n.setAttribute('rel','noopener noreferrer'); }
+            });
+          }
+
+          function extractMath(src){
+            const maths = [];
+            const put = (tex, display) => { maths.push({ tex, display }); return '\u27E6M' + (maths.length - 1) + '\u27E7'; };
+            const parts = src.split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g);
+            for(let i = 0; i < parts.length; i += 2){
+              parts[i] = parts[i]
+                .replace(/\$\$([\s\S]+?)\$\$/g, (_, m) => put(m, true))
+                .replace(/\\\[([\s\S]+?)\\\]/g, (_, m) => put(m, true))
+                .replace(/\\\(([\s\S]+?)\\\)/g, (_, m) => put(m, false))
+                .replace(/\$(?!\s)([^$\n]*[^$\s\\])\$(?![\d$])/g, (_, m) => put(m, false));
             }
-            return `
-              <div class="gen-loader">
-                <div class="gen-canvas-wrap">
-                  <div class="gen-noise-grid">${cells}</div>
-                  <div class="gen-sweep"></div>
-                  <div class="gen-ring"></div>
-                </div>
-                <div class="gen-status-text" id="genStatusText">${GEN_STATUS_MESSAGES[0]}</div>
-                <div class="gen-eta" id="genEta">Elapsed: 0s</div>
-              </div>
-            `;
+            return { text: parts.join(''), maths };
           }
 
-          function startGenAnimation(){
-            genStartTime = Date.now();
-            let msgIndex = 0;
-            const statusEl = () => document.getElementById('genStatusText');
-            const etaEl = () => document.getElementById('genEta');
-
-            clearInterval(genInterval);
-            genInterval = setInterval(() => {
-              const elapsed = Date.now() - genStartTime;
-              if (etaEl()) etaEl().textContent = `Elapsed: ${fmtElapsed(elapsed)}`;
-
-              const newIndex = Math.min(GEN_STATUS_MESSAGES.length - 1, Math.floor(elapsed / 45000));
-              if (newIndex !== msgIndex && statusEl()){
-                msgIndex = newIndex;
-                statusEl().style.opacity = 0;
-                setTimeout(() => {
-                  if (statusEl()){ statusEl().textContent = GEN_STATUS_MESSAGES[msgIndex]; statusEl().style.opacity = 1; }
-                }, 200);
+          const COPY_LABEL = '<span>Copy</span>';
+          function enhanceCode(root, final){
+            $$('pre', root).forEach(pre => {
+              const code = pre.querySelector('code');
+              const raw = (code || pre).textContent.replace(/\n$/, '');
+              const m = /language-([\w#+.-]+)/.exec(code ? code.className : '');
+              const lang = m ? m[1].toLowerCase() : '';
+              let inner = esc(raw);
+              if(window.hljs){
+                try{
+                  if(lang && hljs.getLanguage(lang)) inner = hljs.highlight(raw, { language: lang, ignoreIllegals: true }).value;
+                  else if(final && raw.length < 20000) inner = hljs.highlightAuto(raw).value;
+                }catch(e){}
               }
-            }, 1000);
+              const box = document.createElement('div');
+              box.className = 'codebox';
+              box.innerHTML = `<div class="codebox-head"><span class="codebox-lang"></span><button class="code-btn" type="button" data-act="copy-code">${icon('copy')}${COPY_LABEL}</button></div><pre><code class="hljs"></code></pre>`;
+              $('.codebox-lang', box).textContent = lang || 'code';
+              $('code', box).innerHTML = inner;
+              pre.replaceWith(box);
+            });
+            $$('table', root).forEach(t => {
+              if(t.parentElement.classList.contains('table-wrap')) return;
+              const w = document.createElement('div'); w.className = 'table-wrap';
+              t.replaceWith(w); w.appendChild(t);
+            });
           }
 
-          function stopGenAnimation(){
-            clearInterval(genInterval);
-            genInterval = null;
-            clearTimeout(genPollTimer);
-            genPollTimer = null;
-            clearTimeout(genGiveupTimer);
-            genGiveupTimer = null;
+          function mdInto(el, src, final){
+            if(!HAS_MD){ el.textContent = src; el.style.whiteSpace = 'pre-wrap'; return; }
+            const { text, maths } = extractMath(src || '');
+            let html = '';
+            try{ html = DOMPurify.sanitize(marked.parse(text)); }catch(e){ html = '<p>' + esc(text) + '</p>'; }
+            html = html.replace(/\u27E6M(\d+)\u27E7/g, (_, i) => {
+              const m = maths[+i]; if(!m) return '';
+              try{ return window.katex ? katex.renderToString(m.tex, { displayMode: m.display, throwOnError: false }) : esc(m.tex); }
+              catch(e){ return esc(m.tex); }
+            });
+            el.innerHTML = html;
+            enhanceCode(el, final);
           }
 
-          function resetGenerateButton(){
-            const btn = document.getElementById('generateBtn');
-            btn.disabled = false;
-            btn.innerHTML = '<svg class="icon icon-sm" viewBox="0 0 24 24" stroke="white"><path d="M12 2l1.8 5.6L19.5 9l-5.7 1.4L12 16l-1.8-5.6L4.5 9l5.7-1.4z"/></svg><span>Generate image</span>';
+          function splitThink(t){
+            const m = /^\s*<think>([\s\S]*?)(<\/think>|$)/.exec(t);
+            if(!m) return { think:null, answer:t, done:true };
+            return { think:m[1].trim(), answer:t.slice(m[0].length).replace(/^\s+/, ''), done: m[2] !== '' };
           }
+          function stripThink(t){ return t.replace(/^\s*<think>[\s\S]*?(<\/think>|$)\s*/, ''); }
 
-          function showGenError(output, title, detail){
-            stopGenAnimation();
-            output.innerHTML = `
-              <div class="output-empty">
-                <div class="output-empty-title" style="color:#d93025">${escapeHtml(title)}</div>
-                ${detail ? `<div class="output-empty-sub">${escapeHtml(detail)}</div>` : ''}
-              </div>`;
-            resetGenerateButton();
-          }
-
-          async function generateImage(){
-            const prompt = document.getElementById('imgPrompt').value.trim();
-            if (!prompt){ alert('Please enter a prompt'); return; }
-
-            const btn = document.getElementById('generateBtn');
-            const output = document.getElementById('imgOutput');
-
-            btn.disabled = true;
-            btn.innerHTML = '<span>Generating...</span>';
-            output.innerHTML = buildGenLoader();
-            startGenAnimation();
-
-            genGiveupTimer = setTimeout(() => {
-              showGenError(
-                output,
-                'Still not done after 15 minutes',
-                'The CPU runner may be overloaded or the job genuinely stuck. Try again with fewer steps or a smaller image, or check the workflow\u2019s image_server.log in the Actions run for the real error.'
-              );
-            }, GEN_GIVEUP_MS);
-
-            let jobId;
-            try {
-              const res = await fetch('/image/generate', {
-                method:'POST',
-                headers: { 'Content-Type':'application/json' },
-                body: JSON.stringify({
-                  prompt,
-                  negative_prompt: document.getElementById('imgNeg').value.trim(),
-                  width: parseInt(document.getElementById('imgW').value) || 512,
-                  height: parseInt(document.getElementById('imgH').value) || 512,
-                  steps: parseInt(document.getElementById('imgSteps').value) || 15,
-                  guidance_scale: parseFloat(document.getElementById('imgCfg').value) || 7.5,
-                  seed: parseInt(document.getElementById('imgSeed').value) || -1
-                })
-              });
-              const data = await res.json();
-              if (!res.ok || data.error){
-                showGenError(output, 'Submit failed', data.error || ('HTTP ' + res.status));
-                return;
+          function paintAssistant(turn, text, streaming){
+            const { think, answer, done } = splitThink(text);
+            const slot = $('.think-slot', turn), md = $('.md', turn);
+            if(think !== null){
+              let d = $('details', slot);
+              if(!d){
+                slot.innerHTML = '<details class="think"><summary></summary><div class="think-body"></div></details>';
+                d = $('details', slot); d.open = streaming && !done;
               }
-              jobId = data.job_id;
-            } catch(err){
-              showGenError(output, 'Network error', err.message);
+              $('.think-body', d).textContent = think;
+              $('summary', d).textContent = done ? 'Thought process' : 'Thinking…';
+              if(done && !d.dataset.closed){ d.dataset.closed = '1'; if(streaming) d.open = false; }
+            } else slot.innerHTML = '';
+            if(!answer && streaming && think === null){
+              md.innerHTML = '<div class="typing"><i></i><i></i><i></i></div>';
               return;
             }
-
-            async function poll(){
-              try{
-                const sres = await fetch('/image/status/' + jobId, { cache:'no-store' });
-                if (!sres.ok){
-                  genPollTimer = setTimeout(poll, 3000);
-                  return;
-                }
-                const sdata = await sres.json();
-                if (sdata.status === 'error'){
-                  showGenError(output, 'Generation failed', sdata.error || 'Unknown error');
-                  return;
-                }
-                if (sdata.status === 'done'){
-                  const rres = await fetch('/image/result/' + jobId, { cache:'no-store' });
-                  const rdata = await rres.json();
-                  stopGenAnimation();
-                  if (rdata.image){
-                    output.innerHTML = `<img src="data:image/png;base64,${rdata.image}" alt="Generated image">`;
-                  } else {
-                    output.innerHTML = `
-                      <div class="output-empty">
-                        <div class="output-empty-title" style="color:#d93025">No image returned</div>
-                      </div>`;
-                  }
-                  resetGenerateButton();
-                  return;
-                }
-                genPollTimer = setTimeout(poll, 3000);
-              }catch(err){
-                genPollTimer = setTimeout(poll, 4000);
-              }
+            if(!answer && think !== null && !done){ md.innerHTML = ''; return; }
+            mdInto(md, answer, !streaming);
+            if(streaming){
+              let t = md, c;
+              while((c = t.lastElementChild) && /^(UL|OL|LI|BLOCKQUOTE|P|H[1-6])$/.test(c.tagName)) t = c;
+              const caret = document.createElement('span'); caret.className = 'caret'; t.appendChild(caret);
             }
+          }
+
+          const chatCol = $('#chatCol'), chatScroll = $('#chatScroll'), chatInput = $('#chatInput'), sendBtn = $('#sendBtn');
+
+          chatScroll.addEventListener('scroll', () => {
+            S.stick = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 90;
+          }, { passive:true });
+          function scrollDown(force){ if(force || S.stick) chatScroll.scrollTop = chatScroll.scrollHeight; }
+
+          function heroHTML(){
+            const none = !S.installedChat.length;
+            return `<div class="hero">
+              ${icon('spark','hero-logo')}
+              <h1>${none ? 'Let\u2019s get you a model' : 'How can I help you today?'}</h1>
+              ${none
+                ? `<div class="notice"><div><b>No language model installed yet.</b><br>Pick one from the library — it downloads straight to this runner.</div><button class="btn accent" data-act="goto-models">Install</button></div>`
+                : `<p>Ask anything, paste code, or work through some math.</p><div class="chips">${SUGGESTIONS.map(s => `<button class="chip" data-act="chip" data-text="${esc(s)}">${esc(s)}</button>`).join('')}</div>`}
+            </div>`;
+          }
+
+          function addTurn(role, content, isLast){
+            const t = document.createElement('div');
+            if(role === 'user'){
+              t.className = 'turn u';
+              const b = document.createElement('div'); b.className = 'u-bubble'; b.textContent = content; t.appendChild(b);
+            } else {
+              t.className = 'turn a' + (isLast ? ' last' : '');
+              t.innerHTML = `<div class="a-body"><div class="think-slot"></div><div class="md"></div></div><div class="a-actions"><button class="icon-btn" data-act="copy-msg" title="Copy">${icon('copy','sm')}</button>${isLast ? `<button class="icon-btn" data-act="retry" title="Regenerate">${icon('refresh','sm')}</button>` : ''}</div>`;
+              paintAssistant(t, content, false);
+            }
+            chatCol.appendChild(t);
+            return t;
+          }
+
+          function renderChat(){
+            chatCol.innerHTML = '';
+            if(!S.history.length){ chatCol.innerHTML = heroHTML(); return; }
+            const lastA = S.history.map(m => m.role).lastIndexOf('assistant');
+            S.history.forEach((m, i) => addTurn(m.role, m.content, i === lastA && i === S.history.length - 1));
+            S.stick = true; scrollDown(true);
+          }
+
+          function updateSend(){
+            const empty = !chatInput.value.trim();
+            sendBtn.disabled = !S.streaming && empty;
+            sendBtn.classList.toggle('stop', S.streaming);
+            $('#sendIcon use').setAttribute('href', S.streaming ? '#i-stop' : '#i-up');
+            sendBtn.title = S.streaming ? 'Stop' : 'Send';
+          }
+          chatInput.addEventListener('input', () => {
+            chatInput.style.height = 'auto';
+            chatInput.style.height = Math.min(chatInput.scrollHeight, 220) + 'px';
+            updateSend();
+          });
+          chatInput.addEventListener('keydown', e => {
+            if(e.key === 'Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); sendMessage(); }
+          });
+
+          async function sendMessage(override){
+            if(S.streaming) return;
+            const text = (override != null ? override : chatInput.value).trim();
+            if(!text) return;
+            if(!S.chatModel){ toast('Install a language model first'); showView('models'); return; }
+            if(!S.history.length) chatCol.innerHTML = '';
+            S.history.push({ role:'user', content:text });
+            addTurn('user', text);
+            chatInput.value = ''; chatInput.style.height = 'auto';
+            S.stick = true; scrollDown(true);
+            await streamReply();
+          }
+
+          async function streamReply(){
+            $$('.turn.a.last').forEach(t => t.classList.remove('last'));
+            const turn = document.createElement('div');
+            turn.className = 'turn a';
+            turn.innerHTML = `<div class="a-body"><div class="think-slot"></div><div class="md"><div class="typing"><i></i><i></i><i></i></div></div></div>`;
+            chatCol.appendChild(turn);
+            scrollDown(true);
+
+            S.streaming = true; updateSend();
+            const ctrl = new AbortController(); S.abort = ctrl;
+            let content = '', thinking = '', raf = 0, last = 0;
+            const combined = () => (thinking ? '<think>' + thinking + '</think>' : '') + content;
+            const paint = () => { raf = 0; paintAssistant(turn, combined(), true); scrollDown(); last = performance.now(); };
+            const schedule = () => { if(raf) return; const wait = Math.max(0, 50 - (performance.now() - last)); raf = setTimeout(() => requestAnimationFrame(paint), wait); };
+
+            let errMsg = '';
+            try{
+              const msgs = [{ role:'system', content:SYSTEM_PROMPT }].concat(
+                S.history.map(m => ({ role:m.role, content: m.role === 'assistant' ? stripThink(m.content) : m.content })));
+              const res = await fetch('/api/chat', { method:'POST', headers:JSON_H, signal:ctrl.signal,
+                body: JSON.stringify({ model:S.chatModel, messages:msgs, stream:true }) });
+              if(!res.ok){ let d = ''; try{ d = (await res.json()).error; }catch(e){} throw new Error(d || ('HTTP ' + res.status)); }
+              const reader = res.body.getReader(), dec = new TextDecoder();
+              let buf = '';
+              for(;;){
+                const { done, value } = await reader.read();
+                if(done) break;
+                buf += dec.decode(value, { stream:true });
+                let nl;
+                while((nl = buf.indexOf('\n')) >= 0){
+                  const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+                  if(!line) continue;
+                  let p; try{ p = JSON.parse(line); }catch(e){ continue; }
+                  if(p.error) throw new Error(p.error);
+                  if(p.message){
+                    if(p.message.thinking) thinking += p.message.thinking;
+                    if(p.message.content) content += p.message.content;
+                    schedule();
+                  }
+                }
+              }
+            }catch(err){
+              if(err.name !== 'AbortError') errMsg = err.message || 'Something went wrong';
+            }finally{
+              clearTimeout(raf); raf = 0;
+              S.streaming = false; S.abort = null; updateSend();
+            }
+
+            const full = combined();
+            if(full.trim()){
+              paintAssistant(turn, full, false);
+              S.history.push({ role:'assistant', content:full });
+              turn.classList.add('last');
+              turn.insertAdjacentHTML('beforeend', `<div class="a-actions"><button class="icon-btn" data-act="copy-msg" title="Copy">${icon('copy','sm')}</button><button class="icon-btn" data-act="retry" title="Regenerate">${icon('refresh','sm')}</button></div>`);
+            } else if(!errMsg){
+              turn.remove();
+            }
+            if(errMsg){
+              $('.md', turn).innerHTML = '';
+              const e = document.createElement('div'); e.className = 'err';
+              e.innerHTML = `<span>${esc(errMsg)}</span><button class="btn ghost" data-act="retry-error">Try again</button>`;
+              turn.appendChild(e);
+            }
+            scrollDown();
+            saveConv();
+            chatInput.focus();
+          }
+
+          function stopStream(){ if(S.abort) S.abort.abort(); }
+
+          async function regenerate(){
+            if(S.streaming) return;
+            if(S.history.length && S.history[S.history.length - 1].role === 'assistant') S.history.pop();
+            renderChat();
+            if(S.history.length) await streamReply();
+          }
+
+          function saveConv(){
+            if(!S.history.length) return;
+            let c = S.convs.find(x => x.id === S.curId);
+            if(!c){
+              const first = S.history.find(m => m.role === 'user');
+              c = { id:String(Date.now()), title:(first ? first.content : 'New chat').replace(/\s+/g,' ').slice(0, 44), messages:S.history, ts:Date.now() };
+              S.curId = c.id; S.convs.unshift(c);
+            } else {
+              c.messages = S.history; c.ts = Date.now();
+              S.convs = [c].concat(S.convs.filter(x => x !== c));
+            }
+            store.set('ua_convs', S.convs);
+            renderConvList();
+          }
+          function renderConvList(){
+            const q = $('#search').value.trim().toLowerCase();
+            const now = new Date(), day0 = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+            const groups = { 'Today':[], 'Previous 7 days':[], 'Older':[] };
+            S.convs.forEach(c => {
+              if(q && !c.title.toLowerCase().includes(q)) return;
+              (c.ts >= day0 ? groups['Today'] : c.ts >= day0 - 6*864e5 ? groups['Previous 7 days'] : groups['Older']).push(c);
+            });
+            let h = '';
+            Object.keys(groups).forEach(g => {
+              if(!groups[g].length) return;
+              h += `<div class="sb-label">${g}</div>` + groups[g].map(c =>
+                `<div class="conv${c.id === S.curId ? ' active' : ''}" data-act="open-conv" data-id="${c.id}"><span class="conv-t">${esc(c.title)}</span><button class="conv-x" data-act="del-conv" data-id="${c.id}" title="Delete">${icon('x','sm')}</button></div>`).join('');
+            });
+            $('#convList').innerHTML = h;
+          }
+          function newChat(){
+            if(S.streaming) stopStream();
+            S.history = []; S.curId = null; renderChat(); renderConvList(); showView('chat');
+            chatInput.value = ''; chatInput.style.height = 'auto'; updateSend();
+          }
+          $('#search').addEventListener('input', renderConvList);
+
+          function closeMenu(){ $('#modelMenu').hidden = true; }
+          function openMenu(){
+            const m = $('#modelMenu');
+            let h = S.installedChat.map(x => `<button class="menu-item" data-act="use-chat" data-name="${esc(x.name)}"><div class="grow">${esc(x.name)}<small>${[x.params, x.quant, fmtBytes(x.size)].filter(Boolean).join(' · ')}</small></div>${x.name === S.chatModel ? icon('check','chk') : ''}</button>`).join('');
+            if(h) h += '<div class="menu-sep"></div>';
+            h += `<button class="menu-item" data-act="goto-models"><div class="grow">Install more models…</div>${icon('cube','sm')}</button>`;
+            m.innerHTML = h; m.hidden = false;
+          }
+          function updatePill(){
+            $('#modelPillText').textContent = S.chatModel || 'No model installed';
+            updateSend();
+          }
+
+          async function refreshChat(){
+            try{
+              const d = await jfetch('/api/tags');
+              S.ollamaOk = true;
+              S.installedChat = (d.models || []).map(m => ({ name:m.name, size:m.size, params:m.details && m.details.parameter_size, quant:m.details && m.details.quantization_level }));
+            }catch(e){ S.ollamaOk = false; }
+            if(!S.installedChat.some(m => m.name === S.chatModel)){
+              S.chatModel = S.installedChat.length ? S.installedChat[0].name : '';
+              store.set('ua_chat_model', S.chatModel);
+            }
+            updatePill(); updateStatus();
+            if(!S.history.length && S.view === 'chat') chatCol.innerHTML = heroHTML();
+          }
+          function isInstalled(tag){ return S.installedChat.some(m => m.name === tag || m.name === tag + ':latest'); }
+
+          async function pullModel(tag){
+            tag = (tag || '').trim();
+            if(!tag) return;
+            if(S.pulls[tag] && S.pulls[tag].active) return;
+            const ctrl = new AbortController();
+            const st = S.pulls[tag] = { active:true, status:'Starting…', layers:{}, completed:0, total:0, ctrl, t0:Date.now(), error:null };
+            renderModels();
+            try{
+              const res = await fetch('/api/pull', { method:'POST', headers:JSON_H, signal:ctrl.signal, body:JSON.stringify({ model:tag, stream:true }) });
+              if(!res.ok){ let d = ''; try{ d = (await res.json()).error; }catch(e){} throw new Error(d || ('HTTP ' + res.status)); }
+              const reader = res.body.getReader(), dec = new TextDecoder();
+              let buf = '', lastUi = 0;
+              for(;;){
+                const { done, value } = await reader.read();
+                if(done) break;
+                buf += dec.decode(value, { stream:true });
+                let nl;
+                while((nl = buf.indexOf('\n')) >= 0){
+                  const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+                  if(!line) continue;
+                  let p; try{ p = JSON.parse(line); }catch(e){ continue; }
+                  if(p.error) throw new Error(p.error);
+                  if(p.status) st.status = p.status;
+                  if(p.digest && p.total){ st.layers[p.digest] = { t:p.total, c:p.completed || 0 }; }
+                  let T = 0, C = 0; Object.values(st.layers).forEach(l => { T += l.t; C += l.c; });
+                  st.total = T; st.completed = C;
+                  const now = performance.now();
+                  if(now - lastUi > 250){ lastUi = now; tickProgress(); }
+                }
+              }
+              delete S.pulls[tag];
+              toast('Installed ' + tag);
+            }catch(e){
+              st.active = false;
+              st.error = e.name === 'AbortError' ? 'Cancelled' : e.message;
+            }
+            await refreshChat();
+            renderModels();
+          }
+
+          let imgPoll = null;
+          async function refreshImage(){
+            try{
+              const d = await jfetch('/image/models');
+              S.imgOk = !!d.ready;
+              S.imgCatalog = d.catalog || []; S.imgInstalled = d.installed || []; S.imgInstalls = d.installs || {};
+              S.diskFree = d.disk_free_gb;
+            }catch(e){ S.imgOk = false; }
+            if(!S.imgInstalled.some(m => m.file === S.imageModel)){
+              S.imageModel = S.imgInstalled.length ? S.imgInstalled[0].file : '';
+              store.set('ua_image_model', S.imageModel);
+            }
+            fillImgSelect();
+            const active = Object.values(S.imgInstalls).some(i => i.status === 'starting' || i.status === 'downloading');
+            if(active && !imgPoll) imgPoll = setInterval(refreshImageTick, 1000);
+            if(!active && imgPoll){ clearInterval(imgPoll); imgPoll = null; }
+          }
+          let lastImgSig = '';
+          async function refreshImageTick(){
+            await refreshImage();
+            const sig = JSON.stringify([S.imgInstalled.map(m => m.file), Object.entries(S.imgInstalls).map(([k, v]) => k + v.status + (v.error || ''))]);
+            if(sig !== lastImgSig){ lastImgSig = sig; renderModels(); } else tickProgress();
+          }
+          function fillImgSelect(){
+            const sel = $('#imgModel');
+            sel.innerHTML = S.imgInstalled.length
+              ? S.imgInstalled.map(m => `<option value="${esc(m.file)}"${m.file === S.imageModel ? ' selected' : ''}>${esc(m.name)}</option>`).join('')
+              : '<option value="">No image model installed</option>';
+            $('#imgModelHint').innerHTML = S.imgInstalled.length ? '' : 'Install one first — <a data-act="goto-models-image">open the model library</a>.';
+          }
+          $('#imgModel').addEventListener('change', e => {
+            S.imageModel = e.target.value; store.set('ua_image_model', S.imageModel);
+            const m = S.imgInstalled.find(x => x.file === S.imageModel);
+            if(m){ $('#imgSteps').value = m.steps; $('#imgCfg').value = m.cfg; }
+          });
+
+          async function installImage(body){
+            try{
+              await jfetch('/image/models/install', { method:'POST', headers:JSON_H, body:JSON.stringify(body) });
+              await refreshImage(); renderModels();
+            }catch(e){ toast(e.message); }
+          }
+
+          function genLoader(){
+            return `<div class="gen"><div class="gen-art">${icon('spark')}</div><div class="gen-text" id="genText">Submitting…</div><div class="bar indet" id="genBar"><i></i></div><div class="gen-sub" id="genSub">0s</div></div>`;
+          }
+          async function generateImage(){
+            if(S.genBusy) return;
+            const prompt = $('#imgPrompt').value.trim();
+            if(!prompt){ toast('Please enter a prompt'); return; }
+            if(!S.imageModel){ toast('Install an image model first'); S.tab = 'image'; showView('models'); return; }
+            const btn = $('#genBtn'), out = $('#imgOut');
+            S.genBusy = true; btn.disabled = true; btn.querySelector('span').textContent = 'Generating…';
+            out.innerHTML = genLoader();
+            const t0 = Date.now();
+            const tick = setInterval(() => { const s = $('#genSub'); if(s && !s.dataset.p) s.textContent = fmtDur((Date.now() - t0) / 1000); }, 1000);
+            const [w, h] = $('#imgSize').value.split('x').map(Number);
+            const done = () => { clearInterval(tick); S.genBusy = false; btn.disabled = false; btn.querySelector('span').textContent = 'Generate'; };
+            const fail = (title, detail) => {
+              done();
+              out.innerHTML = `<div class="out-empty"><b style="color:var(--danger)">${esc(title)}</b>${esc(detail || '')}</div>`;
+            };
+            let id;
+            try{
+              const d = await jfetch('/image/generate', { method:'POST', headers:JSON_H, body:JSON.stringify({
+                prompt, negative_prompt:$('#imgNeg').value.trim(), model:S.imageModel, width:w, height:h,
+                steps:parseInt($('#imgSteps').value) || 15, guidance_scale:parseFloat($('#imgCfg').value) || 7.5,
+                seed:isNaN(parseInt($('#imgSeed').value)) ? -1 : parseInt($('#imgSeed').value) }) });
+              id = d.job_id;
+            }catch(e){ return fail('Could not start', e.message); }
+
+            const poll = async () => {
+              try{
+                const s = await jfetch('/image/status/' + id, { cache:'no-store' });
+                if(s.status === 'error') return fail('Generation failed', s.error);
+                if(s.status === 'done'){
+                  const r = await jfetch('/image/result/' + id, { cache:'no-store' });
+                  done();
+                  const src = 'data:image/png;base64,' + r.image;
+                  out.innerHTML = `<img src="${src}" alt="Generated image"><div class="out-actions"><a class="btn ghost" style="background:var(--surface);text-decoration:none" download="image-${Date.now()}.png" href="${src}">${icon('down','sm')}Save</a></div>`;
+                  return;
+                }
+                const txt = $('#genText'), bar = $('#genBar'), sub = $('#genSub');
+                if(txt){
+                  if(s.status === 'queued'){ txt.textContent = 'Waiting for the engine…'; bar.classList.add('indet'); }
+                  else if(s.progress){
+                    const p = s.progress, pct = p.cur / p.tot * 100;
+                    txt.textContent = p.cur >= p.tot ? 'Decoding image…' : `Sampling · step ${p.cur} of ${p.tot}`;
+                    bar.classList.remove('indet'); $('i', bar).style.width = pct + '%';
+                    const el = (Date.now() / 1000 - s.started);
+                    const eta = p.cur > 0 ? el / p.cur * (p.tot - p.cur) : 0;
+                    sub.dataset.p = '1'; sub.textContent = `${fmtDur(Date.now() / 1000 - s.created)} elapsed` + (p.cur > 0 && p.cur < p.tot ? ` · ~${fmtDur(eta)} left` : '');
+                  } else { txt.textContent = 'Loading model & encoding prompt…'; bar.classList.add('indet'); }
+                }
+                setTimeout(poll, 1500);
+              }catch(e){ setTimeout(poll, 3000); }
+            };
             poll();
           }
 
-          /* ---------- init ---------- */
-          loadChatHistory();
-          chatInput.focus();
+          function progText(st){
+            if(st.total){
+              const el = (Date.now() - (st.t0 || Date.now())) / 1000, sp = el > 1 ? st.completed / el : 0;
+              return `${fmtBytes(st.completed)} / ${fmtBytes(st.total)}` + (sp ? ` · ${fmtBytes(sp)}/s` : '') + ` · ${Math.floor(st.completed / st.total * 100)}%`;
+            }
+            return st.status || 'Starting…';
+          }
+          function progHTML(key, st){
+            const pct = st.total ? Math.min(100, st.completed / st.total * 100) : 0;
+            return `<div class="prog" data-key="${esc(key)}"><div class="bar${st.total ? '' : ' indet'}"><i style="width:${pct}%"></i></div><div class="prog-text">${esc(progText(st))}</div></div>`;
+          }
+          function card(o){
+            return `<div class="mcard${o.sel ? ' sel' : ''}"><div class="mcard-main">
+              <div class="mcard-title">${esc(o.title)}${(o.badges || []).map(b => `<span class="badge${b === 'Recommended' || b === 'Selected' ? '' : ' gray'}">${esc(b)}</span>`).join('')}</div>
+              <div class="mcard-sub">${esc(o.sub)}</div>
+              ${o.desc ? `<div class="mcard-desc">${esc(o.desc)}</div>` : ''}
+              ${o.prog || ''}${o.error ? `<div class="prog-err">${esc(o.error)}</div>` : ''}
+            </div><div class="mcard-act">${o.actions || ''}</div></div>`;
+          }
+          const sec = (t, inner) => `<div class="sec">${t}</div><div class="grid">${inner}</div>`;
+
+          function chatLists(){
+            let h = '';
+            const inst = S.installedChat.map(m => card({
+              title:m.name, sub:[m.params, m.quant, fmtBytes(m.size)].filter(Boolean).join(' · '),
+              sel:m.name === S.chatModel, badges:m.name === S.chatModel ? ['Selected'] : [],
+              actions:(m.name === S.chatModel ? '' : `<button class="btn" data-act="use-chat" data-name="${esc(m.name)}">Use</button>`) +
+                      `<button class="btn danger" data-act="del-chat" data-name="${esc(m.name)}" title="Delete">${icon('trash','sm')}</button>`
+            })).join('');
+            h += sec('Installed', inst || '<div class="empty-note">Nothing installed yet. Choose a model below.</div>');
+
+            const lib = new Set(OLLAMA_LIBRARY.map(m => m.tag));
+            const extra = Object.keys(S.pulls).filter(t => !lib.has(t) && !isInstalled(t));
+            const items = OLLAMA_LIBRARY.filter(m => !isInstalled(m.tag)).map(m => ({ tag:m.tag, name:m.name, size:m.size, badges:m.badges, desc:m.desc }))
+              .concat(extra.map(t => ({ tag:t, name:t, size:0, badges:['Custom'], desc:'' })));
+            const libH = items.map(m => {
+              const st = S.pulls[m.tag], active = st && st.active;
+              return card({
+                title:m.name, sub:m.tag + (m.size ? ` · ${m.size.toFixed(1)} GB` : ''), badges:m.badges, desc:m.desc,
+                prog: active ? progHTML('pull:' + m.tag, st) : '', error: st && st.error,
+                actions: active ? `<button class="btn ghost" data-act="cancel-pull" data-tag="${esc(m.tag)}">Cancel</button>`
+                                : `<button class="btn accent" data-act="pull" data-tag="${esc(m.tag)}">${icon('down','sm')}Install</button>`
+              });
+            }).join('');
+            h += sec('Library', libH || '<div class="empty-note">Everything in the library is installed.</div>');
+            return h;
+          }
+
+          function imageLists(){
+            if(!S.imgOk) return '<div class="empty-note" style="margin-top:20px">The image engine isn\u2019t reachable yet. It may still be starting — reopen this tab in a moment.</div>';
+            const inst = S.imgInstalled.map(m => card({
+              title:m.name, sub:m.file + ' · ' + fmtBytes(m.size), sel:m.file === S.imageModel, badges:m.file === S.imageModel ? ['Selected'] : [],
+              actions:(m.file === S.imageModel ? '' : `<button class="btn" data-act="use-img" data-file="${esc(m.file)}">Use</button>`) +
+                      `<button class="btn danger" data-act="del-img" data-file="${esc(m.file)}" title="Delete">${icon('trash','sm')}</button>`
+            })).join('');
+            let h = sec('Installed', inst || '<div class="empty-note">Nothing installed yet. Choose a model below.</div>');
+            const have = new Set(S.imgInstalled.map(m => m.file));
+            const rows = S.imgCatalog.filter(m => !have.has(m.file)).map(m => ({ key:m.id, title:m.name, sub:`${m.file} · ${m.size_gb.toFixed(1)} GB`, badges:m.badges, desc:m.desc, id:m.id }));
+            Object.keys(S.imgInstalls).filter(k => k.startsWith('custom:') && !have.has(S.imgInstalls[k].file)).forEach(k => {
+              rows.push({ key:k, title:S.imgInstalls[k].file, sub:'Custom download', badges:['Custom'], desc:'', id:null });
+            });
+            const libH = rows.map(m => {
+              const st = S.imgInstalls[m.key], active = st && (st.status === 'starting' || st.status === 'downloading');
+              const view = st ? { total:st.total, completed:st.downloaded, t0:st.started * 1000, status:'Starting…' } : null;
+              return card({
+                title:m.title, sub:m.sub, badges:m.badges, desc:m.desc,
+                prog: active ? progHTML('img:' + m.key, view) : '', error: st && st.status === 'error' ? st.error : '',
+                actions: active ? `<button class="btn ghost" data-act="cancel-img" data-key="${esc(m.key)}">Cancel</button>`
+                                : (m.id ? `<button class="btn accent" data-act="img-install" data-id="${esc(m.id)}">${icon('down','sm')}Install</button>` : '')
+              });
+            }).join('');
+            h += sec('Library', libH || '<div class="empty-note">Everything in the library is installed.</div>');
+            return h;
+          }
+
+          function renderModels(){
+            if(S.view !== 'models') return;
+            $('#tabChat').classList.toggle('on', S.tab === 'chat');
+            $('#tabImage').classList.toggle('on', S.tab === 'image');
+            $('#modelLists').innerHTML = S.tab === 'chat' ? chatLists() : imageLists();
+            $('#customLabel').textContent = S.tab === 'chat' ? 'Install by name' : 'Install from a direct link';
+            $('#customInput').placeholder = S.tab === 'chat' ? 'e.g. llama3.2:3b' : 'https://huggingface.co/…/resolve/main/model.safetensors';
+            $('#customHint').innerHTML = S.tab === 'chat'
+              ? 'Any model from <a href="https://ollama.com/library" target="_blank" rel="noopener">ollama.com/library</a> works — type its name and tag.'
+              : 'Paste a direct download link to a Stable Diffusion 1.x / 2.x / Turbo checkpoint (.safetensors or .ckpt), for example from Hugging Face.';
+            $('#diskInfo').textContent = S.diskFree != null ? `${S.diskFree} GB free disk` : '';
+          }
+          function tickProgress(){
+            let miss = false;
+            Object.keys(S.pulls).forEach(t => {
+              const st = S.pulls[t]; if(!st.active) return;
+              if(!patch('pull:' + t, st)) miss = true;
+            });
+            Object.keys(S.imgInstalls).forEach(k => {
+              const st = S.imgInstalls[k]; if(st.status !== 'downloading' && st.status !== 'starting') return;
+              if(!patch('img:' + k, { total:st.total, completed:st.downloaded, t0:st.started * 1000, status:'Starting…' })) miss = true;
+            });
+            if(miss && S.view === 'models') renderModels();
+          }
+          function patch(key, st){
+            const el = $(`.prog[data-key="${CSS.escape(key)}"]`);
+            if(!el) return false;
+            const pct = st.total ? Math.min(100, st.completed / st.total * 100) : 0;
+            const bar = $('.bar', el);
+            bar.classList.toggle('indet', !st.total);
+            $('i', bar).style.width = pct + '%';
+            $('.prog-text', el).textContent = progText(st);
+            return true;
+          }
+
+          function updateStatus(){
+            $('#dot').className = 'dot ' + (S.ollamaOk ? 'ok' : 'bad');
+            $('#statusText').textContent = S.ollamaOk ? (S.installedChat.length + ' model' + (S.installedChat.length === 1 ? '' : 's') + ' installed') : 'Ollama offline';
+          }
+          async function refreshAll(){ await Promise.all([refreshChat(), refreshImage()]); renderModels(); }
+
+          async function customInstall(){
+            const v = $('#customInput').value.trim();
+            if(!v) return;
+            $('#customInput').value = '';
+            if(S.tab === 'chat') pullModel(v);
+            else installImage({ url:v });
+          }
+          $('#customInput').addEventListener('keydown', e => { if(e.key === 'Enter') customInstall(); });
+
+          document.addEventListener('click', async e => {
+            const nav = e.target.closest('.nav-item');
+            if(nav){ showView(nav.dataset.view); return; }
+            const tab = e.target.closest('[data-tab]');
+            if(tab){ S.tab = tab.dataset.tab; renderModels(); if(S.tab === 'image') refreshImage().then(renderModels); return; }
+
+            const el = e.target.closest('[data-act]');
+            if(!el){ if(!e.target.closest('#pillWrap')) closeMenu(); return; }
+            const a = el.dataset.act;
+            if(a !== 'model-menu' && !el.closest('#modelMenu')) closeMenu();
+
+            switch(a){
+              case 'toggle-sb': toggleSidebar(); break;
+              case 'new-chat': newChat(); break;
+              case 'theme': { const t = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; applyTheme(t); store.set('ua_theme', t); break; }
+              case 'model-menu': $('#modelMenu').hidden ? openMenu() : closeMenu(); break;
+              case 'use-chat': S.chatModel = el.dataset.name; store.set('ua_chat_model', S.chatModel); updatePill(); closeMenu(); renderModels(); break;
+              case 'goto-models': S.tab = 'chat'; showView('models'); break;
+              case 'goto-models-image': S.tab = 'image'; showView('models'); break;
+              case 'send': S.streaming ? stopStream() : sendMessage(); break;
+              case 'chip': chatInput.value = el.dataset.text; chatInput.dispatchEvent(new Event('input')); sendMessage(); break;
+              case 'open-conv': {
+                if(e.target.closest('.conv-x')) break;
+                const c = S.convs.find(x => x.id === el.dataset.id);
+                if(c){ if(S.streaming) stopStream(); S.curId = c.id; S.history = c.messages; renderChat(); renderConvList(); showView('chat'); }
+                break;
+              }
+              case 'del-conv': {
+                e.stopPropagation();
+                S.convs = S.convs.filter(c => c.id !== el.dataset.id); store.set('ua_convs', S.convs);
+                if(S.curId === el.dataset.id) newChat(); else renderConvList();
+                break;
+              }
+              case 'copy-code': {
+                const box = el.closest('.codebox'); const ok = await copyText($('code', box).textContent);
+                el.classList.toggle('ok', ok); el.innerHTML = (ok ? icon('check') + '<span>Copied</span>' : icon('copy') + '<span>Failed</span>');
+                setTimeout(() => { el.classList.remove('ok'); el.innerHTML = icon('copy') + COPY_LABEL; }, 1600);
+                break;
+              }
+              case 'copy-msg': {
+                const turn = el.closest('.turn'); const md = $('.md', turn);
+                if(await copyText(md.innerText)) toast('Copied');
+                break;
+              }
+              case 'retry': case 'retry-error': regenerate(); break;
+              case 'generate': generateImage(); break;
+              case 'custom-install': customInstall(); break;
+              case 'pull': pullModel(el.dataset.tag); break;
+              case 'cancel-pull': { const st = S.pulls[el.dataset.tag]; if(st && st.ctrl) st.ctrl.abort(); break; }
+              case 'del-chat': {
+                if(!confirm('Delete ' + el.dataset.name + '?')) break;
+                try{ await jfetch('/api/delete', { method:'DELETE', headers:JSON_H, body:JSON.stringify({ model:el.dataset.name }) }); }catch(err){ toast(err.message); }
+                await refreshChat(); renderModels(); break;
+              }
+              case 'img-install': installImage({ id:el.dataset.id }); break;
+              case 'cancel-img': try{ await jfetch('/image/models/cancel', { method:'POST', headers:JSON_H, body:JSON.stringify({ key:el.dataset.key }) }); }catch(err){} break;
+              case 'use-img': S.imageModel = el.dataset.file; store.set('ua_image_model', S.imageModel); fillImgSelect(); { const m = S.imgInstalled.find(x => x.file === S.imageModel); if(m){ $('#imgSteps').value = m.steps; $('#imgCfg').value = m.cfg; } } renderModels(); break;
+              case 'del-img': {
+                if(!confirm('Delete ' + el.dataset.file + '?')) break;
+                try{ await jfetch('/image/models/delete', { method:'POST', headers:JSON_H, body:JSON.stringify({ file:el.dataset.file }) }); }catch(err){ toast(err.message); }
+                await refreshImage(); renderModels(); break;
+              }
+            }
+          });
+          document.addEventListener('keydown', e => { if(e.key === 'Escape') closeMenu(); });
+
+          (async function init(){
+            renderChat(); renderConvList(); updateSend();
+            await refreshChat();
+            if(!S.history.length) chatCol.innerHTML = heroHTML();
+            refreshImage();
+            if(S.imgInstalled.length){ const m = S.imgInstalled.find(x => x.file === S.imageModel); if(m){ $('#imgSteps').value = m.steps; $('#imgCfg').value = m.cfg; } }
+            chatInput.focus();
+          })();
+          })();
           </script>
           </body>
           </html>
-          HTMLEOF
+          CLAUDE_UI_EOF_9d3f
+          echo "Web UI written: $(wc -c < web/index.html) bytes"
 
       # ============================================================
       # 4. CADDY + CLOUDFLARE TUNNEL
@@ -1431,6 +1697,9 @@ jobs:
           CODE2=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/image/health)
           echo "Caddy -> /image/health: HTTP $CODE2"
 
+          CODE3=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/)
+          echo "Caddy -> / (UI): HTTP $CODE3"
+
       - name: Start Cloudflare tunnel
         run: |
           set -euo pipefail
@@ -1449,17 +1718,17 @@ jobs:
           echo "PUBLIC_URL=$URL" >> $GITHUB_ENV
 
           {
-            echo "### Unified AI Panel is Live"
+            echo "### Unified AI Panel is live"
             echo ""
-            echo "URL: [$URL]($URL)"
+            echo "**URL:** [$URL]($URL)"
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| Chat  | \`qwen2.5:7b-instruct\` |"
-            echo "| Image | SD1.5 on CPU, q8_0 — expect a few minutes per image on a free runner |"
+            echo "| Chat | \`qwen2.5:7b-instruct\` |"
+            echo "| Image | SD 1.5 on CPU (q8_0) — a few minutes per image |"
+            echo "| UI | Claude-style single-page app, dark/light theme, KaTeX, highlight.js |"
             echo ""
-            echo "CPU runner — chat and image generation speed depend entirely on load."
-            echo "Image jobs time out and report an error after 12 minutes instead of hanging."
+            echo "The page supports: Markdown, code highlighting, LaTeX, conversation history, model install/delete, and CPU image generation."
           } >> $GITHUB_STEP_SUMMARY
 
       - name: Keep alive (6h)
