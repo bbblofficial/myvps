@@ -24,9 +24,14 @@ jobs:
           sudo apt-get install -y curl wget jq psmisc python3-venv python3-pip unzip libgomp1
 
       # ============================================================
-      # 1. IMAGE — CPU diffusion backend (stable-diffusion.cpp)
+      # 1. IMAGE — CPU diffusion backend (stable-diffusion.cpp, single model)
+      #    NOTE: swapped out the previous diffusion-model + separate 4B
+      #    text-encoder pairing for a single standard SD1.5 checkpoint,
+      #    quantized at load time (--type q8_0). That combo was too heavy
+      #    for a free 2-core CPU runner and caused generation to silently
+      #    run for a very long time, which is what looked like a freeze.
       # ============================================================
-      - name: Download CPU image-gen binary + models
+      - name: Download CPU image-gen binary + model
         run: |
           set -euo pipefail
           mkdir -p image-engine
@@ -70,31 +75,29 @@ jobs:
           unzip -o sd-bin.zip
           rm -f sd-bin.zip
 
-          if [ ! -f ./sd-cli ]; then
-            echo "::error::sd-cli not found after extraction."
+          # Some releases name the CLI "sd" rather than "sd-cli" — handle both.
+          if [ -f ./sd-cli ]; then
+            SD_BIN=./sd-cli
+          elif [ -f ./sd ]; then
+            SD_BIN=./sd
+            cp ./sd ./sd-cli
+          else
+            echo "::error::No sd-cli/sd binary found after extraction."
             find . -type f | head -n 50
             exit 1
           fi
           chmod +x ./sd-cli
           ls -lh sd-cli
-          LD_LIBRARY_PATH=. ./sd-cli --help 2>&1 | head -n 5 || true
+          LD_LIBRARY_PATH=. ./sd-cli --help 2>&1 | head -n 20 || true
 
-          echo "Downloading diffusion model (Z-Image-Turbo Q4_0)..."
-          wget -q "https://huggingface.co/FINAL-Bench/POCKET-Zimage-CPU/resolve/main/z_image_turbo-Q4_0-pocket.gguf" \
-            -O z_image_turbo-Q4_0-pocket.gguf
-
-          echo "Downloading text encoder..."
-          wget -q "https://huggingface.co/lmstudio-community/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf" \
-            -O Qwen3-4B-Instruct-2507-Q4_K_M.gguf
-
-          echo "Downloading VAE..."
-          wget -q "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors" \
-            -O ae.safetensors
+          echo "Downloading Stable Diffusion 1.5 checkpoint (single file, quantized at load time)..."
+          wget -q "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors" \
+            -O sd-v1-5.safetensors
 
           ls -lh
           echo "Image engine setup complete."
 
-      - name: Write image server (async job queue → sd-cli binary)
+      - name: Write image server (async job queue → sd-cli binary, with real timeout + error surfacing)
         run: |
           mkdir -p server
           cat > server/image_server.py <<'PYEOF'
@@ -105,12 +108,15 @@ jobs:
           from pydantic import BaseModel
 
           MODEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "image-engine"))
-          SD_BINARY  = os.path.join(MODEL_DIR, "sd-cli")
-          DIFF_MODEL = os.path.join(MODEL_DIR, "z_image_turbo-Q4_0-pocket.gguf")
-          VAE_MODEL  = os.path.join(MODEL_DIR, "ae.safetensors")
-          LLM_MODEL  = os.path.join(MODEL_DIR, "Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
+          SD_BINARY = os.path.join(MODEL_DIR, "sd-cli")
+          SD_MODEL  = os.path.join(MODEL_DIR, "sd-v1-5.safetensors")
 
-          STATE = {"ready": False, "model": "cpu-image-engine", "error": None}
+          # CPU inference on a free runner is genuinely slow. Give it real
+          # headroom, but fail loudly instead of hanging forever so the UI
+          # never looks silently frozen.
+          GEN_TIMEOUT_SECONDS = 12 * 60
+
+          STATE = {"ready": False, "model": "sd-v1-5 (CPU, q8_0)", "error": None}
           JOBS = {}
           JOB_LOCK = threading.Lock()
           JOB_TTL = 3600
@@ -118,15 +124,14 @@ jobs:
           def check_ready():
               missing = []
               for label, path in [
-                  ("sd-cli binary",   SD_BINARY),
-                  ("diffusion model", DIFF_MODEL),
-                  ("VAE",             VAE_MODEL),
-                  ("text encoder",    LLM_MODEL),
+                  ("sd-cli binary", SD_BINARY),
+                  ("model checkpoint", SD_MODEL),
               ]:
                   if not os.path.isfile(path):
                       missing.append(f"{label}: {path}")
               if missing:
                   STATE["error"] = "Missing files: " + "; ".join(missing)
+                  STATE["ready"] = False
                   return False
               STATE["ready"] = True
               STATE["error"] = None
@@ -144,8 +149,8 @@ jobs:
           class GenRequest(BaseModel):
               prompt: str
               negative_prompt: str = ""
-              steps: int = 3
-              guidance_scale: float = 1.0
+              steps: int = 15
+              guidance_scale: float = 7.5
               width: int = 512
               height: int = 512
               seed: int = -1
@@ -172,6 +177,11 @@ jobs:
                   if not STATE["ready"]:
                       return JSONResponse({"error": "Model not ready", "state": STATE}, status_code=503)
 
+              # Clamp inputs to keep a single job from running indefinitely.
+              steps = max(1, min(req.steps, 30))
+              width = max(256, min(req.width, 768))
+              height = max(256, min(req.height, 768))
+
               job_id = uuid.uuid4().hex
               with JOB_LOCK:
                   JOBS[job_id] = {"status": "pending", "created": time.time(), "prompt": (req.prompt or "")[:120]}
@@ -181,27 +191,42 @@ jobs:
                   try:
                       cmd = [
                           SD_BINARY,
-                          "--diffusion-model", DIFF_MODEL,
-                          "--vae", VAE_MODEL,
-                          "--llm", LLM_MODEL,
+                          "-m", SD_MODEL,
+                          "--type", "q8_0",
                           "-p", req.prompt,
                           "-n", req.negative_prompt,
-                          "-W", str(req.width),
-                          "-H", str(req.height),
-                          "--steps", str(req.steps),
+                          "-W", str(width),
+                          "-H", str(height),
+                          "--steps", str(steps),
                           "--cfg-scale", str(req.guidance_scale),
                           "-s", str(req.seed) if req.seed != -1 else "-1",
                           "-o", out_png,
-                          "--fa",
-                          "--vae-tiling",
                           "-t", "4",
                       ]
                       t0 = time.time()
-                      result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=MODEL_DIR, env=RUNTIME_ENV)
+                      try:
+                          result = subprocess.run(
+                              cmd, capture_output=True, text=True,
+                              timeout=GEN_TIMEOUT_SECONDS, cwd=MODEL_DIR, env=RUNTIME_ENV
+                          )
+                      except subprocess.TimeoutExpired:
+                          with JOB_LOCK:
+                              JOBS[job_id].update({
+                                  "status": "error",
+                                  "error": f"Generation exceeded {GEN_TIMEOUT_SECONDS}s and was stopped. "
+                                           f"Try fewer steps or a smaller image."
+                              })
+                          return
+
                       if result.returncode != 0:
                           raise Exception(f"sd-cli exited {result.returncode}: {result.stderr[-800:]}")
+
+                      if not os.path.exists(out_png):
+                          raise Exception(f"sd-cli reported success but produced no output file. stderr: {result.stderr[-500:]}")
+
                       with open(out_png, "rb") as f:
                           img_bytes = f.read()
+
                       elapsed = time.time() - t0
                       b64 = base64.b64encode(img_bytes).decode()
                       with JOB_LOCK:
@@ -241,7 +266,7 @@ jobs:
         run: |
           python3 -m venv $HOME/venv
           $HOME/venv/bin/pip install --upgrade pip
-          $HOME/venv/bin/pip install "fastapi[standard]" "uvicorn[standard]" pydantic huggingface_hub
+          $HOME/venv/bin/pip install "fastapi[standard]" "uvicorn[standard]" pydantic
 
       - name: Start image server
         run: |
@@ -842,11 +867,11 @@ jobs:
                     <div class="field-row three">
                       <div class="field">
                         <label class="field-label">Steps</label>
-                        <input type="number" id="imgSteps" value="3" min="2" max="8">
+                        <input type="number" id="imgSteps" value="15" min="4" max="30">
                       </div>
                       <div class="field">
                         <label class="field-label">CFG</label>
-                        <input type="number" id="imgCfg" value="1.0" min="0.5" max="3" step="0.1">
+                        <input type="number" id="imgCfg" value="7.5" min="1" max="15" step="0.5">
                       </div>
                       <div class="field">
                         <label class="field-label">Seed</label>
@@ -1162,16 +1187,27 @@ jobs:
 
           /* ---------- image generation ---------- */
           const GEN_STATUS_MESSAGES = [
-            'Reading your prompt...',
-            'Setting up the canvas...',
-            'Sketching composition...',
-            'Refining details...',
-            'Adding texture and light...',
-            'Upscaling and polishing...'
+            'Submitting job...',
+            'Running on the CPU inference engine...',
+            'Still working - CPU diffusion is slow, this can take several minutes...',
+            'Still working - thanks for your patience...'
           ];
+
+          // Client-side give-up: if a job hasn't resolved in this long, stop polling
+          // and tell the person plainly instead of looking frozen forever.
+          const GEN_GIVEUP_MS = 15 * 60 * 1000; // 15 minutes
 
           let genInterval = null;
           let genStartTime = null;
+          let genPollTimer = null;
+          let genGiveupTimer = null;
+
+          function fmtElapsed(ms){
+            const s = Math.floor(ms / 1000);
+            const m = Math.floor(s / 60);
+            const r = s % 60;
+            return m > 0 ? `${m}m ${r}s` : `${r}s`;
+          }
 
           function buildGenLoader(){
             let cells = '';
@@ -1186,26 +1222,26 @@ jobs:
                   <div class="gen-ring"></div>
                 </div>
                 <div class="gen-status-text" id="genStatusText">${GEN_STATUS_MESSAGES[0]}</div>
-                <div class="gen-progress-track"><div class="gen-progress-fill" id="genProgressFill"></div></div>
-                <div class="gen-eta" id="genEta">Running on CPU - typically under a minute for 512x512</div>
+                <div class="gen-eta" id="genEta">Elapsed: 0s</div>
               </div>
             `;
           }
 
-          function startGenAnimation(estSeconds){
+          // Honest progress: we never claim to know how close the job is to finishing.
+          // We just show real elapsed time and rotate a status message so it's
+          // visibly alive, not a fake bar that implies near-completion.
+          function startGenAnimation(){
             genStartTime = Date.now();
             let msgIndex = 0;
             const statusEl = () => document.getElementById('genStatusText');
-            const fillEl = () => document.getElementById('genProgressFill');
             const etaEl = () => document.getElementById('genEta');
 
             clearInterval(genInterval);
             genInterval = setInterval(() => {
-              const elapsed = (Date.now() - genStartTime) / 1000;
-              const pct = Math.min(96, (elapsed / estSeconds) * 100);
-              if (fillEl()) fillEl().style.width = pct + '%';
+              const elapsed = Date.now() - genStartTime;
+              if (etaEl()) etaEl().textContent = `Elapsed: ${fmtElapsed(elapsed)}`;
 
-              const newIndex = Math.min(GEN_STATUS_MESSAGES.length - 1, Math.floor((pct / 100) * GEN_STATUS_MESSAGES.length));
+              const newIndex = Math.min(GEN_STATUS_MESSAGES.length - 1, Math.floor(elapsed / 45000));
               if (newIndex !== msgIndex && statusEl()){
                 msgIndex = newIndex;
                 statusEl().style.opacity = 0;
@@ -1213,17 +1249,32 @@ jobs:
                   if (statusEl()){ statusEl().textContent = GEN_STATUS_MESSAGES[msgIndex]; statusEl().style.opacity = 1; }
                 }, 200);
               }
-
-              if (etaEl()){
-                const remaining = Math.max(0, Math.round(estSeconds - elapsed));
-                etaEl().textContent = remaining > 0 ? `About ${remaining}s remaining` : 'Finishing up...';
-              }
-            }, 300);
+            }, 1000);
           }
 
           function stopGenAnimation(){
             clearInterval(genInterval);
             genInterval = null;
+            clearTimeout(genPollTimer);
+            genPollTimer = null;
+            clearTimeout(genGiveupTimer);
+            genGiveupTimer = null;
+          }
+
+          function resetGenerateButton(){
+            const btn = document.getElementById('generateBtn');
+            btn.disabled = false;
+            btn.innerHTML = '<svg class="icon icon-sm" viewBox="0 0 24 24" stroke="white"><path d="M12 2l1.8 5.6L19.5 9l-5.7 1.4L12 16l-1.8-5.6L4.5 9l5.7-1.4z"/></svg><span>Generate image</span>';
+          }
+
+          function showGenError(output, title, detail){
+            stopGenAnimation();
+            output.innerHTML = `
+              <div class="output-empty">
+                <div class="output-empty-title" style="color:#d93025">${escapeHtml(title)}</div>
+                ${detail ? `<div class="output-empty-sub">${escapeHtml(detail)}</div>` : ''}
+              </div>`;
+            resetGenerateButton();
           }
 
           async function generateImage(){
@@ -1232,12 +1283,19 @@ jobs:
 
             const btn = document.getElementById('generateBtn');
             const output = document.getElementById('imgOutput');
-            const estSeconds = 50;
 
             btn.disabled = true;
             btn.innerHTML = '<span>Generating...</span>';
             output.innerHTML = buildGenLoader();
-            startGenAnimation(estSeconds);
+            startGenAnimation();
+
+            genGiveupTimer = setTimeout(() => {
+              showGenError(
+                output,
+                'Still not done after 15 minutes',
+                'The CPU runner may be overloaded or the job genuinely stuck. Try again with fewer steps or a smaller image, or check the workflow\u2019s image_server.log in the Actions run for the real error.'
+              );
+            }, GEN_GIVEUP_MS);
 
             let jobId;
             try {
@@ -1249,45 +1307,32 @@ jobs:
                   negative_prompt: document.getElementById('imgNeg').value.trim(),
                   width: parseInt(document.getElementById('imgW').value) || 512,
                   height: parseInt(document.getElementById('imgH').value) || 512,
-                  steps: parseInt(document.getElementById('imgSteps').value) || 3,
-                  guidance_scale: parseFloat(document.getElementById('imgCfg').value) || 1.0,
+                  steps: parseInt(document.getElementById('imgSteps').value) || 15,
+                  guidance_scale: parseFloat(document.getElementById('imgCfg').value) || 7.5,
                   seed: parseInt(document.getElementById('imgSeed').value) || -1
                 })
               });
               const data = await res.json();
               if (!res.ok || data.error){
-                stopGenAnimation();
-                output.innerHTML = `
-                  <div class="output-empty">
-                    <div class="output-empty-title" style="color:#d93025">Submit failed</div>
-                    <div class="output-empty-sub">${escapeHtml(data.error || ('HTTP ' + res.status))}</div>
-                  </div>`;
+                showGenError(output, 'Submit failed', data.error || ('HTTP ' + res.status));
                 return;
               }
               jobId = data.job_id;
             } catch(err){
-              stopGenAnimation();
-              output.innerHTML = `
-                <div class="output-empty">
-                  <div class="output-empty-title" style="color:#d93025">Network error</div>
-                  <div class="output-empty-sub">${escapeHtml(err.message)}</div>
-                </div>`;
+              showGenError(output, 'Network error', err.message);
               return;
             }
 
             async function poll(){
               try{
                 const sres = await fetch('/image/status/' + jobId, { cache:'no-store' });
+                if (!sres.ok){
+                  genPollTimer = setTimeout(poll, 3000);
+                  return;
+                }
                 const sdata = await sres.json();
                 if (sdata.status === 'error'){
-                  stopGenAnimation();
-                  output.innerHTML = `
-                    <div class="output-empty">
-                      <div class="output-empty-title" style="color:#d93025">Generation failed</div>
-                      <div class="output-empty-sub">${escapeHtml(sdata.error || 'Unknown error')}</div>
-                    </div>`;
-                  btn.disabled = false;
-                  btn.innerHTML = '<svg class="icon icon-sm" viewBox="0 0 24 24" stroke="white"><path d="M12 2l1.8 5.6L19.5 9l-5.7 1.4L12 16l-1.8-5.6L4.5 9l5.7-1.4z"/></svg><span>Generate image</span>';
+                  showGenError(output, 'Generation failed', sdata.error || 'Unknown error');
                   return;
                 }
                 if (sdata.status === 'done'){
@@ -1295,24 +1340,19 @@ jobs:
                   const rdata = await rres.json();
                   stopGenAnimation();
                   if (rdata.image){
-                    const fill = document.getElementById('genProgressFill');
-                    if (fill) fill.style.width = '100%';
-                    setTimeout(() => {
-                      output.innerHTML = `<img src="data:image/png;base64,${rdata.image}" alt="Generated image">`;
-                    }, 250);
+                    output.innerHTML = `<img src="data:image/png;base64,${rdata.image}" alt="Generated image">`;
                   } else {
                     output.innerHTML = `
                       <div class="output-empty">
                         <div class="output-empty-title" style="color:#d93025">No image returned</div>
                       </div>`;
                   }
-                  btn.disabled = false;
-                  btn.innerHTML = '<svg class="icon icon-sm" viewBox="0 0 24 24" stroke="white"><path d="M12 2l1.8 5.6L19.5 9l-5.7 1.4L12 16l-1.8-5.6L4.5 9l5.7-1.4z"/></svg><span>Generate image</span>';
+                  resetGenerateButton();
                   return;
                 }
-                setTimeout(poll, 2000);
+                genPollTimer = setTimeout(poll, 3000);
               }catch(err){
-                setTimeout(poll, 3000);
+                genPollTimer = setTimeout(poll, 4000);
               }
             }
             poll();
@@ -1409,9 +1449,10 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Chat  | \`qwen2.5:7b-instruct\` |"
-            echo "| Image | CPU diffusion engine — 512x512 in roughly under a minute |"
+            echo "| Image | SD1.5 on CPU, q8_0 — expect a few minutes per image on a free runner |"
             echo ""
-            echo "CPU runner — chat and image generation speed depend on load."
+            echo "CPU runner — chat and image generation speed depend entirely on load."
+            echo "Image jobs time out and report an error after 12 minutes instead of hanging."
           } >> $GITHUB_STEP_SUMMARY
 
       - name: Keep alive (6h)
