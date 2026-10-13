@@ -25,11 +25,6 @@ jobs:
 
       # ============================================================
       # 1. IMAGE — CPU diffusion backend (stable-diffusion.cpp, single model)
-      #    NOTE: swapped out the previous diffusion-model + separate 4B
-      #    text-encoder pairing for a single standard SD1.5 checkpoint,
-      #    quantized at load time (--type q8_0). That combo was too heavy
-      #    for a free 2-core CPU runner and caused generation to silently
-      #    run for a very long time, which is what looked like a freeze.
       # ============================================================
       - name: Download CPU image-gen binary + model
         run: |
@@ -75,7 +70,6 @@ jobs:
           unzip -o sd-bin.zip
           rm -f sd-bin.zip
 
-          # Some releases name the CLI "sd" rather than "sd-cli" — handle both.
           if [ -f ./sd-cli ]; then
             SD_BIN=./sd-cli
           elif [ -f ./sd ]; then
@@ -111,9 +105,6 @@ jobs:
           SD_BINARY = os.path.join(MODEL_DIR, "sd-cli")
           SD_MODEL  = os.path.join(MODEL_DIR, "sd-v1-5.safetensors")
 
-          # CPU inference on a free runner is genuinely slow. Give it real
-          # headroom, but fail loudly instead of hanging forever so the UI
-          # never looks silently frozen.
           GEN_TIMEOUT_SECONDS = 12 * 60
 
           STATE = {"ready": False, "model": "sd-v1-5 (CPU, q8_0)", "error": None}
@@ -177,7 +168,6 @@ jobs:
                   if not STATE["ready"]:
                       return JSONResponse({"error": "Model not ready", "state": STATE}, status_code=503)
 
-              # Clamp inputs to keep a single job from running indefinitely.
               steps = max(1, min(req.steps, 30))
               width = max(256, min(req.width, 768))
               height = max(256, min(req.height, 768))
@@ -354,8 +344,12 @@ jobs:
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <title>Unified AI</title>
 
-          <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-          <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+          <!--
+            Pin marked to v4 so renderer.code() keeps the classic signature
+            (code, infostring, escaped) and don't have to guess token shapes.
+          -->
+          <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
 
           <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
           <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -907,9 +901,31 @@ jobs:
 
           marked.setOptions({ breaks: true, gfm: true });
 
+          function escapeHtml(s){
+            const d = document.createElement('div');
+            d.textContent = s;
+            return d.innerHTML;
+          }
+
           const renderer = new marked.Renderer();
-          renderer.code = function(code, infostring){
-            const lang = (infostring || '').trim().split(/\s+/)[0] || '';
+
+          // -----------------------------------------------------------------
+          // FIX: marked v5+ passes a single token object { text, lang, escaped }
+          // to renderer.code, whereas v4 passed positional args
+          // (code, infostring, escaped). The old handler coerced that object
+          // to a string, which is why the code block rendered as
+          // "[object Object]". We now detect the shape and handle both.
+          // -----------------------------------------------------------------
+          renderer.code = function(tokenOrCode, infostring){
+            let code, lang;
+            if (tokenOrCode && typeof tokenOrCode === 'object'){
+              code = tokenOrCode.text != null ? String(tokenOrCode.text) : '';
+              lang = String(tokenOrCode.lang || '').trim().split(/\s+/)[0] || '';
+            } else {
+              code = tokenOrCode != null ? String(tokenOrCode) : '';
+              lang = String(infostring || '').trim().split(/\s+/)[0] || '';
+            }
+
             let highlighted;
             try{
               if (lang && hljs.getLanguage(lang)){
@@ -920,6 +936,7 @@ jobs:
             } catch(e){
               highlighted = escapeHtml(code);
             }
+
             const id = 'code_' + Math.random().toString(36).slice(2, 10);
             const label = lang || 'text';
             return `<div class="code-block">
@@ -935,14 +952,9 @@ jobs:
           };
           marked.use({ renderer });
 
-          function escapeHtml(s){
-            const d = document.createElement('div');
-            d.textContent = s;
-            return d.innerHTML;
-          }
-
           function copyCode(id, btn){
             const codeEl = document.getElementById(id);
+            if (!codeEl) return;
             const text = codeEl.innerText;
             navigator.clipboard.writeText(text).then(() => {
               const original = btn.innerHTML;
@@ -1193,9 +1205,7 @@ jobs:
             'Still working - thanks for your patience...'
           ];
 
-          // Client-side give-up: if a job hasn't resolved in this long, stop polling
-          // and tell the person plainly instead of looking frozen forever.
-          const GEN_GIVEUP_MS = 15 * 60 * 1000; // 15 minutes
+          const GEN_GIVEUP_MS = 15 * 60 * 1000;
 
           let genInterval = null;
           let genStartTime = null;
@@ -1227,9 +1237,6 @@ jobs:
             `;
           }
 
-          // Honest progress: we never claim to know how close the job is to finishing.
-          // We just show real elapsed time and rotate a status message so it's
-          // visibly alive, not a fake bar that implies near-completion.
           function startGenAnimation(){
             genStartTime = Date.now();
             let msgIndex = 0;
