@@ -9,10 +9,14 @@ concurrency:
   group: polyguard-deploy
   cancel-in-progress: true
 
+env:
+  MODEL_ID: unitary/multilingual-toxic-xlm-roberta
+  MODEL_DIR: ${{ github.workspace }}/models/polyguard
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # حداکثر مجاز گیت‌هاب 6 ساعت است
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repository
@@ -23,36 +27,50 @@ jobs:
         with:
           python-version: "3.11"
 
+      # ─── FIX: added sentencepiece + tiktoken ───
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          # CPU-only torch wheel - the default PyPI build drags in CUDA
-          # libraries that are useless (and huge) on this runner.
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
-          pip install --quiet fastapi "uvicorn[standard]" transformers
+          pip install --quiet fastapi "uvicorn[standard]" transformers sentencepiece tiktoken
+
+      - name: Download model to local folder
+        run: |
+          mkdir -p "$MODEL_DIR"
+          python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id=os.environ["MODEL_ID"],
+              local_dir=os.environ["MODEL_DIR"],
+              local_dir_use_symlinks=False,
+              ignore_patterns=["*.h5", "*.msgpack", "*.onnx", "*.tflite", "*.ot"],
+          )
+          print("✔ Model downloaded")
+          PY
+          ls -lh "$MODEL_DIR"
+          du -sh "$MODEL_DIR"
 
       - name: Create PolyGuard app files
         run: |
           mkdir -p app/static
 
-          # ---------- backend ----------
           cat > app/main.py << 'PYEOF'
           import os
-
-          # Must be set before transformers is imported to reliably take effect.
           os.environ["TOKENIZERS_PARALLELISM"] = "false"
+          os.environ["HF_HUB_OFFLINE"] = "1"
+          os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
           from contextlib import asynccontextmanager
           from pathlib import Path
-
           from fastapi import FastAPI
           from fastapi.staticfiles import StaticFiles
           from fastapi.responses import FileResponse
           from pydantic import BaseModel
           from transformers import pipeline
 
-          BASE_DIR = Path(__file__).resolve().parent
-          MODEL_NAME = "unitary/multilingual-toxic-xlm-roberta"
+          BASE_DIR  = Path(__file__).resolve().parent
+          MODEL_DIR = Path(os.environ["POLYGUARD_MODEL_DIR"])
           TOXIC_THRESHOLD = float(os.environ.get("TOXIC_THRESHOLD", "0.5"))
 
           class TextIn(BaseModel):
@@ -61,22 +79,23 @@ jobs:
           state = {"classifier": None, "error": None}
 
           def load_classifier():
+              print(f"[PolyGuard] Loading model from {MODEL_DIR}", flush=True)
               state["classifier"] = pipeline(
                   "text-classification",
-                  model=MODEL_NAME,
-                  tokenizer=MODEL_NAME,
+                  model=str(MODEL_DIR),
+                  tokenizer=str(MODEL_DIR),
                   function_to_apply="sigmoid",
                   top_k=None,
               )
+              print("[PolyGuard] Model loaded ✔", flush=True)
 
           @asynccontextmanager
           async def lifespan(app: FastAPI):
               try:
                   load_classifier()
-                  print("[PolyGuard] Model loaded ✔")
-              except Exception as exc:  # keep the server up so /health reports the failure
+              except Exception as exc:
                   state["error"] = str(exc)
-                  print(f"[PolyGuard] Model failed to load: {exc}")
+                  print(f"[PolyGuard] Model failed to load: {exc}", flush=True)
               yield
 
           app = FastAPI(title="PolyGuard Web", lifespan=lifespan)
@@ -94,8 +113,6 @@ jobs:
               if state["classifier"] is None:
                   return {"error": state["error"] or "model still loading"}
               results = state["classifier"](data.text, truncation=True, max_length=512)[0]
-              # Single-label sigmoid model: just take the highest score it returns
-              # and threshold it, rather than guessing a label string.
               top = max(results, key=lambda r: r["score"])
               is_toxic = top["score"] >= TOXIC_THRESHOLD
               return {"toxic": is_toxic, "label": top["label"], "score": float(top["score"])}
@@ -107,7 +124,6 @@ jobs:
           app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
           PYEOF
 
-          # ---------- frontend ----------
           cat > app/static/index.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html lang="fa" dir="rtl">
@@ -176,13 +192,10 @@ jobs:
                 return;
               }
               const pct = (d.score * 100).toFixed(1);
-              if (d.toxic) {
-                out.className = "out toxic";
-                out.textContent = `🚫 محتوای سمی (اطمینان: ${pct}%)`;
-              } else {
-                out.className = "out safe";
-                out.textContent = `✅ محتوای سالم (اطمینان: ${pct}%)`;
-              }
+              out.className = d.toxic ? "out toxic" : "out safe";
+              out.textContent = d.toxic
+                ? `🚫 محتوای سمی (اطمینان: ${pct}%)`
+                : `✅ محتوای سالم (اطمینان: ${pct}%)`;
             } catch (e) {
               out.className = "out toxic";
               out.textContent = "خطا در ارتباط با سرور";
@@ -190,7 +203,6 @@ jobs:
               btn.disabled = false;
             }
           }
-
           btn.addEventListener("click", check);
           txt.addEventListener("keydown", (e) => {
             if (e.ctrlKey && e.key === "Enter") check();
@@ -198,7 +210,6 @@ jobs:
           JSEOF
 
           echo "✔ All files created"
-          ls -R app
 
       - name: Install cloudflared
         run: |
@@ -207,68 +218,54 @@ jobs:
           ./cloudflared --version
 
       - name: Start FastAPI server
+        env:
+          POLYGUARD_MODEL_DIR: ${{ env.MODEL_DIR }}
         run: |
           nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
-          echo "Waiting for server to become healthy (model download can take a while)..."
+          echo "Waiting for server..."
           STATUS=""
-          for i in $(seq 1 180); do
+          for i in $(seq 1 60); do
             STATUS=$(curl -fs http://localhost:8000/health 2>/dev/null || true)
             if echo "$STATUS" | grep -q '"status":"ok"'; then
-              echo "✔ Server is up and model loaded after ${i} checks"
-              break
+              echo "✔ Server healthy after ${i} checks"; break
             fi
             if echo "$STATUS" | grep -q '"status":"error"'; then
-              echo "❌ Model failed to load:"
-              echo "$STATUS"
-              echo "--- server.log (tail) ---"
-              tail -n 60 server.log || true
-              exit 1
+              echo "❌ Model failed to load:"; echo "$STATUS"
+              tail -n 60 server.log || true; exit 1
             fi
-            sleep 5
+            sleep 2
           done
-
           echo "$STATUS"
-          if ! echo "$STATUS" | grep -q '"status":"ok"'; then
-            echo "❌ Server never became healthy in time"
-            echo "--- server.log (tail) ---"
-            tail -n 60 server.log || true
-            exit 1
-          fi
+          echo "$STATUS" | grep -q '"status":"ok"' || { tail -n 60 server.log; exit 1; }
 
       - name: Start Cloudflare Quick Tunnel
         run: |
           nohup ./cloudflared tunnel --url http://localhost:8000 --no-autoupdate > tunnel.log 2>&1 &
-          echo "Waiting for trycloudflare URL..."
           URL=""
           for i in $(seq 1 60); do
             URL=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" tunnel.log | head -n1 || true)
-            if [ -n "$URL" ]; then break; fi
+            [ -n "$URL" ] && break
             sleep 2
           done
-
-          if [ -z "$URL" ]; then
-            echo "❌ Could not obtain tunnel URL"
-            cat tunnel.log
-            exit 1
-          fi
-
+          [ -z "$URL" ] && { echo "❌ No tunnel URL"; cat tunnel.log; exit 1; }
           echo "PUBLIC_URL=$URL" >> $GITHUB_ENV
           echo "### 🌐 PolyGuard is live at: $URL" >> $GITHUB_STEP_SUMMARY
           echo "🔗 $URL"
 
       - name: Keep service alive
+        env:
+          POLYGUARD_MODEL_DIR: ${{ env.MODEL_DIR }}
         run: |
-          echo "Service running at: $PUBLIC_URL"
-          echo "This job will self-terminate after ~5 hours."
-          # به مدت ~5 ساعت زنده نگه دار (زیر سقف 6 ساعته Actions)
+          echo "Running at: $PUBLIC_URL"
           for i in $(seq 1 300); do
             sleep 60
-            if ! pgrep -f "uvicorn app.main:app" >/dev/null; then
-              echo "⚠ Uvicorn died. Restarting..."
-              nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 >> server.log 2>&1 &
-            fi
-            if ! pgrep -f "cloudflared tunnel" >/dev/null; then
-              echo "⚠ Cloudflared died. Restarting..."
+            pgrep -f "uvicorn app.main:app" >/dev/null || {
+              echo "⚠ Uvicorn died, restarting..."
+              POLYGUARD_MODEL_DIR="$POLYGUARD_MODEL_DIR" \
+                nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 >> server.log 2>&1 &
+            }
+            pgrep -f "cloudflared tunnel" >/dev/null || {
+              echo "⚠ Cloudflared died, restarting..."
               nohup ./cloudflared tunnel --url http://localhost:8000 --no-autoupdate >> tunnel.log 2>&1 &
-            fi
+            }
           done
