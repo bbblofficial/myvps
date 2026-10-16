@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: polyguard-deploy
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -22,7 +26,10 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --quiet fastapi "uvicorn[standard]" transformers torch
+          # CPU-only torch wheel - the default PyPI build drags in CUDA
+          # libraries that are useless (and huge) on this runner.
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet fastapi "uvicorn[standard]" transformers
 
       - name: Create PolyGuard app files
         run: |
@@ -30,55 +37,74 @@ jobs:
 
           # ---------- backend ----------
           cat > app/main.py << 'PYEOF'
+          import os
+
+          # Must be set before transformers is imported to reliably take effect.
+          os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+          from contextlib import asynccontextmanager
+          from pathlib import Path
+
           from fastapi import FastAPI
           from fastapi.staticfiles import StaticFiles
           from fastapi.responses import FileResponse
           from pydantic import BaseModel
           from transformers import pipeline
-          import os
 
-          os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-          app = FastAPI(title="PolyGuard Web")
+          BASE_DIR = Path(__file__).resolve().parent
+          MODEL_NAME = "unitary/multilingual-toxic-xlm-roberta"
+          TOXIC_THRESHOLD = float(os.environ.get("TOXIC_THRESHOLD", "0.5"))
 
           class TextIn(BaseModel):
               text: str
 
-          classifier = None
+          state = {"classifier": None, "error": None}
 
-          def get_clf():
-              global classifier
-              if classifier is None:
-                  classifier = pipeline(
-                      "text-classification",
-                      model="Jayveersinh-Raj/PolyGuard",
-                      tokenizer="Jayveersinh-Raj/PolyGuard",
-                  )
-              return classifier
+          def load_classifier():
+              state["classifier"] = pipeline(
+                  "text-classification",
+                  model=MODEL_NAME,
+                  tokenizer=MODEL_NAME,
+                  function_to_apply="sigmoid",
+                  top_k=None,
+              )
 
-          @app.on_event("startup")
-          def preload():
-              get_clf()
-              print("[PolyGuard] Model loaded ✔")
+          @asynccontextmanager
+          async def lifespan(app: FastAPI):
+              try:
+                  load_classifier()
+                  print("[PolyGuard] Model loaded ✔")
+              except Exception as exc:  # keep the server up so /health reports the failure
+                  state["error"] = str(exc)
+                  print(f"[PolyGuard] Model failed to load: {exc}")
+              yield
+
+          app = FastAPI(title="PolyGuard Web", lifespan=lifespan)
 
           @app.get("/health")
           def health():
+              if state["error"]:
+                  return {"status": "error", "detail": state["error"]}
+              if state["classifier"] is None:
+                  return {"status": "loading"}
               return {"status": "ok"}
 
           @app.post("/api/check")
           async def check(data: TextIn):
-              clf = get_clf()
-              res = clf(data.text, truncation=True, max_length=512)[0]
-              label = res["label"]
-              score = float(res["score"])
-              is_toxic = label.upper() in ("LABEL_1", "TOXIC", "1", "TOXICITY")
-              return {"toxic": is_toxic, "label": label, "score": score}
+              if state["classifier"] is None:
+                  return {"error": state["error"] or "model still loading"}
+              results = state["classifier"](data.text, truncation=True, max_length=512)[0]
+              # Single-label sigmoid model: just take the highest score it returns
+              # and threshold it, rather than guessing a label string.
+              top = max(results, key=lambda r: r["score"])
+              is_toxic = top["score"] >= TOXIC_THRESHOLD
+              return {"toxic": is_toxic, "label": top["label"], "score": float(top["score"])}
 
           @app.get("/")
           def index():
-              return FileResponse("app/static/index.html")
+              return FileResponse(BASE_DIR / "static" / "index.html")
 
-          app.mount("/static", StaticFiles(directory="app/static"), name="static")
+          app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
           PYEOF
 
           # ---------- frontend ----------
@@ -95,12 +121,12 @@ jobs:
             <div class="card">
               <header>
                 <h1>🛡️ PolyGuard</h1>
-                <p>تشخیص محتوای سمی و غیراخلاقی در ۱۰۰+ زبان</p>
+                <p>تشخیص محتوای سمی و غیراخلاقی در چند زبان</p>
               </header>
               <textarea id="txt" placeholder="متن خود را اینجا بنویسید..."></textarea>
               <button id="btn">بررسی کن</button>
               <div id="out" class="out hidden"></div>
-              <footer>Powered by Jayveersinh-Raj/PolyGuard</footer>
+              <footer>Powered by unitary/multilingual-toxic-xlm-roberta</footer>
             </div>
             <script src="/static/script.js"></script>
           </body>
@@ -144,6 +170,11 @@ jobs:
                 body: JSON.stringify({ text }),
               });
               const d = await r.json();
+              if (d.error) {
+                out.className = "out toxic";
+                out.textContent = `⚠ ${d.error}`;
+                return;
+              }
               const pct = (d.score * 100).toFixed(1);
               if (d.toxic) {
                 out.className = "out toxic";
@@ -178,18 +209,31 @@ jobs:
       - name: Start FastAPI server
         run: |
           nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
-          echo "Waiting for server to become healthy..."
-          for i in $(seq 1 120); do
-            if curl -fs http://localhost:8000/health >/dev/null 2>&1; then
-              echo "✔ Server is up after ${i} checks"
+          echo "Waiting for server to become healthy (model download can take a while)..."
+          STATUS=""
+          for i in $(seq 1 180); do
+            STATUS=$(curl -fs http://localhost:8000/health 2>/dev/null || true)
+            if echo "$STATUS" | grep -q '"status":"ok"'; then
+              echo "✔ Server is up and model loaded after ${i} checks"
               break
             fi
-            sleep 3
+            if echo "$STATUS" | grep -q '"status":"error"'; then
+              echo "❌ Model failed to load:"
+              echo "$STATUS"
+              echo "--- server.log (tail) ---"
+              tail -n 60 server.log || true
+              exit 1
+            fi
+            sleep 5
           done
-          curl -s http://localhost:8000/health
-          echo
-          echo "--- server.log (tail) ---"
-          tail -n 30 server.log || true
+
+          echo "$STATUS"
+          if ! echo "$STATUS" | grep -q '"status":"ok"'; then
+            echo "❌ Server never became healthy in time"
+            echo "--- server.log (tail) ---"
+            tail -n 60 server.log || true
+            exit 1
+          fi
 
       - name: Start Cloudflare Quick Tunnel
         run: |
