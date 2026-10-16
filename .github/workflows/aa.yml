@@ -1,4 +1,4 @@
-name: PolyGuard Web + Cloudflare Tunnel
+name: PolyGuard Ensemble Web + Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -10,9 +10,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # ✅ PyTorch-compatible multilingual model (supports Persian)
-  MODEL_ID: unitary/multilingual-toxic-xlm-roberta
-  MODEL_DIR: ${{ github.workspace }}/models/polyguard
+  # ✅ Three complementary models: Persian-specific + multilingual + twitter-trained
+  PERSIAN_MODEL_ID: HamidRezaei/Persian-Offensive-Language-Detection
+  MULTILINGUAL_MODEL_ID: unitary/multilingual-toxic-xlm-roberta
+  TEXTDETOX_MODEL_ID: textdetox/twitter-xlmr-toxicity-classifier
+  MODELS_ROOT: ${{ github.workspace }}/models
+
+  # CPU tuning for 4-core / 16GB RAM runner
+  OMP_NUM_THREADS: "4"
+  MKL_NUM_THREADS: "4"
+  TOKENIZERS_PARALLELISM: "false"
 
 jobs:
   deploy:
@@ -28,95 +35,193 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ✅ FIXED: protobuf is required by sentencepiece to parse the tokenizer
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
+          # CPU-only torch (avoids ~2.5GB CUDA download)
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          # protobuf is REQUIRED by sentencepiece to parse .bpe.model files
           pip install --quiet fastapi "uvicorn[standard]" transformers sentencepiece protobuf tiktoken
 
-      - name: Download model to local folder
+      - name: Download all models to local folders
         run: |
-          mkdir -p "$MODEL_DIR"
+          mkdir -p "$MODELS_ROOT/persian" "$MODELS_ROOT/multilingual" "$MODELS_ROOT/textdetox"
+
           python - <<'PY'
           import os
           from huggingface_hub import snapshot_download
-          snapshot_download(
-              repo_id=os.environ["MODEL_ID"],
-              local_dir=os.environ["MODEL_DIR"],
-              ignore_patterns=["*.h5", "*.msgpack", "*.onnx", "*.tflite", "*.ot"],
-          )
-          print("✔ Model downloaded")
+
+          jobs = [
+              ("PERSIAN_MODEL_ID",     os.path.join(os.environ["MODELS_ROOT"], "persian")),
+              ("MULTILINGUAL_MODEL_ID", os.path.join(os.environ["MODELS_ROOT"], "multilingual")),
+              ("TEXTDETOX_MODEL_ID",   os.path.join(os.environ["MODELS_ROOT"], "textdetox")),
+          ]
+          for env_key, target in jobs:
+              repo_id = os.environ[env_key]
+              print(f"\n⬇  Downloading {repo_id} → {target}", flush=True)
+              snapshot_download(
+                  repo_id=repo_id,
+                  local_dir=target,
+                  ignore_patterns=["*.h5", "*.msgpack", "*.onnx", "*.tflite", "*.ot", "*.mlmodelc"],
+              )
+              print(f"✔  Done {repo_id}", flush=True)
           PY
-          ls -lh "$MODEL_DIR"
-          du -sh "$MODEL_DIR"
+
+          echo "--- model sizes ---"
+          du -sh "$MODELS_ROOT"/*
+          echo "--- persian ---";     ls -lh "$MODELS_ROOT/persian"
+          echo "--- multilingual ---"; ls -lh "$MODELS_ROOT/multilingual"
+          echo "--- textdetox ---";   ls -lh "$MODELS_ROOT/textdetox"
 
       - name: Create PolyGuard app files
         run: |
           mkdir -p app/static
 
-          # ---------- backend ----------
+          # ==================== BACKEND ====================
           cat > app/main.py << 'PYEOF'
           import os
-          os.environ["TOKENIZERS_PARALLELISM"] = "false"
-          os.environ["HF_HUB_OFFLINE"] = "1"
-          os.environ["TRANSFORMERS_OFFLINE"] = "1"
+          os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+          os.environ.setdefault("HF_HUB_OFFLINE", "1")
+          os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+          os.environ.setdefault("OMP_NUM_THREADS", "4")
+          os.environ.setdefault("MKL_NUM_THREADS", "4")
 
+          import threading
           from contextlib import asynccontextmanager
           from pathlib import Path
+          from typing import Dict, List
+
+          import torch
           from fastapi import FastAPI
           from fastapi.staticfiles import StaticFiles
           from fastapi.responses import FileResponse
           from pydantic import BaseModel
-          from transformers import pipeline
+          from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-          BASE_DIR  = Path(__file__).resolve().parent
-          MODEL_DIR = Path(os.environ["POLYGUARD_MODEL_DIR"])
+          torch.set_num_threads(4)
+
+          BASE_DIR   = Path(__file__).resolve().parent
+          MODELS_ROOT = Path(os.environ["MODELS_ROOT"])
           TOXIC_THRESHOLD = float(os.environ.get("TOXIC_THRESHOLD", "0.5"))
 
+          # ---------- request schema ----------
           class TextIn(BaseModel):
               text: str
 
-          state = {"classifier": None, "error": None}
+          # ---------- global state ----------
+          state = {
+              "models": {},      # name -> (model, tokenizer)
+              "errors": {},      # name -> error string
+              "ready": False,
+          }
 
-          def load_classifier():
-              print(f"[PolyGuard] Loading model from {MODEL_DIR}", flush=True)
-              state["classifier"] = pipeline(
-                  "text-classification",
-                  model=str(MODEL_DIR),
-                  tokenizer=str(MODEL_DIR),
-                  top_k=None,
-              )
-              print("[PolyGuard] Model loaded ✔", flush=True)
+          MODEL_SPECS = {
+              "persian":      {"dir": MODELS_ROOT / "persian",      "mode": "multilabel"},
+              "multilingual": {"dir": MODELS_ROOT / "multilingual", "mode": "multilabel"},
+              "textdetox":    {"dir": MODELS_ROOT / "textdetox",    "mode": "binary"},
+          }
 
+          def _load_one(name: str, spec: dict):
+              try:
+                  print(f"[Ensemble] Loading '{name}' from {spec['dir']}", flush=True)
+                  tok = AutoTokenizer.from_pretrained(str(spec["dir"]), local_files_only=True)
+                  mdl = AutoModelForSequenceClassification.from_pretrained(
+                      str(spec["dir"]), local_files_only=True
+                  )
+                  mdl.eval()
+                  state["models"][name] = (mdl, tok, spec["mode"])
+                  print(f"[Ensemble] ✔ '{name}' loaded", flush=True)
+              except Exception as exc:
+                  state["errors"][name] = str(exc)
+                  print(f"[Ensemble] ✖ '{name}' FAILED: {exc}", flush=True)
+
+          def load_all():
+              threads = []
+              for name, spec in MODEL_SPECS.items():
+                  t = threading.Thread(target=_load_one, args=(name, spec))
+                  t.start()
+                  threads.append(t)
+              for t in threads:
+                  t.join()
+              state["ready"] = True
+              print(f"[Ensemble] All done. Loaded: {list(state['models'].keys())}", flush=True)
+
+          # ---------- inference helpers ----------
+          def _score_multilabel(model, tokenizer, text: str) -> float:
+              """XLM-R / BERT with multi_label_classification head → sigmoid per label."""
+              inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+              with torch.no_grad():
+                  logits = model(**inputs).logits
+              probs = torch.sigmoid(logits).squeeze(0)
+              return float(probs.max().item())
+
+          def _score_binary(model, tokenizer, text: str) -> float:
+              """Softmax binary classifier → probability of class 1 (toxic)."""
+              inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+              with torch.no_grad():
+                  logits = model(**inputs).logits
+              probs = torch.softmax(logits, dim=-1).squeeze(0)
+              if probs.numel() == 1:
+                  return float(probs.item())
+              return float(probs[1].item())
+
+          def ensemble_predict(text: str) -> Dict:
+              votes, scores = {}, {}
+              for name, (mdl, tok, mode) in state["models"].items():
+                  try:
+                      if mode == "binary":
+                          s = _score_binary(mdl, tok, text)
+                      else:
+                          s = _score_multilabel(mdl, tok, text)
+                      scores[name] = round(s, 4)
+                      votes[name]  = s >= TOXIC_THRESHOLD
+                  except Exception as exc:
+                      scores[name] = 0.0
+                      votes[name]  = False
+                      print(f"[Ensemble] inference error in {name}: {exc}", flush=True)
+
+              toxic_votes = sum(votes.values())
+              total = len(votes)
+              # Majority vote: at least ceil(total/2) models must flag
+              needed = max(1, (total + 1) // 2)
+              is_toxic = toxic_votes >= needed
+              avg = round(sum(scores.values()) / total, 4) if total else 0.0
+
+              return {
+                  "toxic": is_toxic,
+                  "score": avg,
+                  "votes": votes,
+                  "scores": scores,
+                  "toxic_votes": toxic_votes,
+                  "total_models": total,
+                  "threshold": TOXIC_THRESHOLD,
+              }
+
+          # ---------- FastAPI app ----------
           @asynccontextmanager
           async def lifespan(app: FastAPI):
-              try:
-                  load_classifier()
-              except Exception as exc:
-                  state["error"] = str(exc)
-                  print(f"[PolyGuard] Model failed to load: {exc}", flush=True)
+              threading.Thread(target=load_all, daemon=True).start()
               yield
 
-          app = FastAPI(title="PolyGuard Web", lifespan=lifespan)
+          app = FastAPI(title="PolyGuard Ensemble", lifespan=lifespan)
 
           @app.get("/health")
           def health():
-              if state["error"]:
-                  return {"status": "error", "detail": state["error"]}
-              if state["classifier"] is None:
-                  return {"status": "loading"}
-              return {"status": "ok"}
+              if not state["ready"]:
+                  return {"status": "loading", "loaded": list(state["models"].keys())}
+              if not state["models"]:
+                  return {"status": "error", "detail": state["errors"]}
+              return {
+                  "status": "ok",
+                  "loaded_models": list(state["models"].keys()),
+                  "errors": state["errors"],
+              }
 
           @app.post("/api/check")
           async def check(data: TextIn):
-              if state["classifier"] is None:
-                  return {"error": state["error"] or "model still loading"}
-              results = state["classifier"](data.text, truncation=True, max_length=512)[0]
-              # For multi-label models, find the highest score
-              top = max(results, key=lambda r: r["score"])
-              is_toxic = top["score"] >= TOXIC_THRESHOLD
-              return {"toxic": is_toxic, "label": top["label"], "score": float(top["score"])}
+              if not state["models"]:
+                  return {"error": state["errors"] or "no models loaded yet"}
+              return ensemble_predict(data.text)
 
           @app.get("/")
           def index():
@@ -125,26 +230,34 @@ jobs:
           app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
           PYEOF
 
-          # ---------- frontend ----------
+          # ==================== FRONTEND ====================
           cat > app/static/index.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html lang="fa" dir="rtl">
           <head>
             <meta charset="UTF-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-            <title>PolyGuard — تشخیص محتوای سمی</title>
+            <title>PolyGuard Ensemble — تشخیص محتوای سمی</title>
             <link rel="stylesheet" href="/static/style.css" />
           </head>
           <body>
             <div class="card">
               <header>
-                <h1>🛡️ PolyGuard</h1>
-                <p>تشخیص محتوای سمی و غیراخلاقی در چند زبان</p>
+                <h1>🛡️ PolyGuard Ensemble</h1>
+                <p>سه مدل هوش مصنوعی با هم رأی می‌دهند: فارسی، چندزبانه، و توییتر</p>
               </header>
-              <textarea id="txt" placeholder="متن خود را اینجا بنویسید..."></textarea>
+
+              <textarea id="txt" placeholder="متن خود را اینجا بنویسید... (Ctrl+Enter برای بررسی)"></textarea>
               <button id="btn">بررسی کن</button>
+
               <div id="out" class="out hidden"></div>
-              <footer>Powered by unitary/multilingual-toxic-xlm-roberta</footer>
+
+              <div id="breakdown" class="breakdown hidden">
+                <h3>جزئیات رأی مدل‌ها</h3>
+                <div id="modelsList"></div>
+              </div>
+
+              <footer>Persian ParsBERT · Unitary XLM-R · TextDetox XLM-R</footer>
             </div>
             <script src="/static/script.js"></script>
           </body>
@@ -154,33 +267,56 @@ jobs:
           cat > app/static/style.css << 'CSSEOF'
           *{box-sizing:border-box;margin:0;padding:0}
           body{font-family:system-ui,Segoe UI,Tahoma,sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-          .card{background:#fff;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.3);max-width:700px;width:100%;padding:40px}
-          header{text-align:center;margin-bottom:24px}
-          h1{font-size:2.2rem;color:#222;margin-bottom:8px}
-          header p{color:#666}
-          textarea{width:100%;height:150px;padding:14px;border:2px solid #e0e0e0;border-radius:12px;font-size:1rem;font-family:inherit;resize:vertical;transition:.3s}
+          .card{background:#fff;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.3);max-width:720px;width:100%;padding:36px}
+          header{text-align:center;margin-bottom:20px}
+          h1{font-size:2rem;color:#222;margin-bottom:6px}
+          header p{color:#666;font-size:.95rem}
+          textarea{width:100%;height:140px;padding:14px;border:2px solid #e0e0e0;border-radius:12px;font-size:1rem;font-family:inherit;resize:vertical;transition:.3s}
           textarea:focus{outline:0;border-color:#667eea}
-          button{width:100%;padding:14px;margin-top:14px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:0;border-radius:12px;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.2s}
+          button{width:100%;padding:14px;margin-top:12px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border:0;border-radius:12px;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.2s}
           button:hover{transform:translateY(-2px);box-shadow:0 10px 20px rgba(102,126,234,.35)}
           button:disabled{opacity:.6;cursor:wait}
-          .out{margin-top:20px;padding:16px;border-radius:12px;font-weight:600;text-align:center}
+          .out{margin-top:18px;padding:16px;border-radius:12px;font-weight:600;text-align:center;font-size:1.05rem}
           .out.hidden{display:none}
           .out.safe{background:#e6ffed;color:#046b2b;border:1px solid #b7f0c8}
           .out.toxic{background:#ffe6e6;color:#a30000;border:1px solid #ffb3b3}
-          footer{text-align:center;margin-top:24px;color:#999;font-size:.85rem}
+          .out.loading{background:#fff8e1;color:#8a6d00;border:1px solid #ffe082}
+          .breakdown{margin-top:18px;padding:16px;background:#f8f9fc;border-radius:12px;border:1px solid #e4e7ef}
+          .breakdown.hidden{display:none}
+          .breakdown h3{font-size:.95rem;color:#444;margin-bottom:12px;text-align:center}
+          .model-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eceff5}
+          .model-row:last-child{border-bottom:0}
+          .model-name{font-size:.88rem;color:#333;font-weight:600}
+          .model-name small{display:block;color:#999;font-weight:400;font-size:.75rem;margin-top:2px}
+          .model-score{font-family:monospace;font-size:.9rem;padding:4px 10px;border-radius:6px;background:#eef1f7}
+          .model-score.toxic{background:#ffe6e6;color:#a30000}
+          .model-score.safe{background:#e6ffed;color:#046b2b}
+          footer{text-align:center;margin-top:20px;color:#999;font-size:.8rem}
+          .out .thr{display:block;font-size:.8rem;font-weight:400;opacity:.75;margin-top:4px}
           CSSEOF
 
           cat > app/static/script.js << 'JSEOF'
           const txt = document.getElementById("txt");
           const btn = document.getElementById("btn");
           const out = document.getElementById("out");
+          const breakdown = document.getElementById("breakdown");
+          const modelsList = document.getElementById("modelsList");
+
+          const MODEL_LABELS = {
+            persian:      "Persian ParsBERT (تخصصی فارسی)",
+            multilingual: "Unitary XLM-R (چندزبانه ۱۰۰+)",
+            textdetox:    "TextDetox XLM-R (۱۵ زبان)"
+          };
 
           async function check() {
             const text = txt.value.trim();
             if (!text) return;
+
             btn.disabled = true;
-            out.className = "out";
-            out.textContent = "⏳ در حال بررسی...";
+            out.className = "out loading";
+            out.textContent = "⏳ در حال بررسی با ۳ مدل...";
+            breakdown.classList.add("hidden");
+
             try {
               const r = await fetch("/api/check", {
                 method: "POST",
@@ -188,16 +324,40 @@ jobs:
                 body: JSON.stringify({ text }),
               });
               const d = await r.json();
+
               if (d.error) {
                 out.className = "out toxic";
                 out.textContent = `⚠ ${d.error}`;
                 return;
               }
+
               const pct = (d.score * 100).toFixed(1);
               out.className = d.toxic ? "out toxic" : "out safe";
-              out.textContent = d.toxic
-                ? `🚫 محتوای سمی (اطمینان: ${pct}%)`
-                : `✅ محتوای سالم (اطمینان: ${pct}%)`;
+              out.innerHTML = d.toxic
+                ? `🚫 محتوای سمی — ${d.toxic_votes} از ${d.total_models} مدل موافق
+                   <span class="thr">میانگین اطمینان: ${pct}٪ · آستانه: ${d.threshold}</span>`
+                : `✅ محتوای سالم — ${d.total_models - d.toxic_votes} از ${d.total_models} مدل مخالف
+                   <span class="thr">میانگین اطمینان: ${pct}٪ · آستانه: ${d.threshold}</span>`;
+
+              // --- breakdown table ---
+              modelsList.innerHTML = "";
+              for (const [name, score] of Object.entries(d.scores)) {
+                const row = document.createElement("div");
+                row.className = "model-row";
+                const flagged = d.votes[name];
+                row.innerHTML = `
+                  <div class="model-name">
+                    ${MODEL_LABELS[name] || name}
+                    <small>${flagged ? "🚩 سمی تشخیص داد" : "✅ سالم تشخیص داد"}</small>
+                  </div>
+                  <div class="model-score ${flagged ? "toxic" : "safe"}">
+                    ${(score * 100).toFixed(1)}٪
+                  </div>
+                `;
+                modelsList.appendChild(row);
+              }
+              breakdown.classList.remove("hidden");
+
             } catch (e) {
               out.className = "out toxic";
               out.textContent = "خطا در ارتباط با سرور";
@@ -205,13 +365,15 @@ jobs:
               btn.disabled = false;
             }
           }
+
           btn.addEventListener("click", check);
           txt.addEventListener("keydown", (e) => {
             if (e.ctrlKey && e.key === "Enter") check();
           });
           JSEOF
 
-          echo "✔ All files created"
+          echo "✔ All app files created"
+          ls -R app
 
       - name: Install cloudflared
         run: |
@@ -221,49 +383,72 @@ jobs:
 
       - name: Start FastAPI server
         env:
-          POLYGUARD_MODEL_DIR: ${{ env.MODEL_DIR }}
+          MODELS_ROOT: ${{ env.MODELS_ROOT }}
         run: |
           nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
-          echo "Waiting for server..."
+          echo "Waiting for models to load (3 models, ~60-120s)..."
+
           STATUS=""
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             STATUS=$(curl -fs http://localhost:8000/health 2>/dev/null || true)
             if echo "$STATUS" | grep -q '"status":"ok"'; then
-              echo "✔ Server healthy after ${i} checks"; break
+              echo "✔ All models loaded after ${i} checks"
+              break
             fi
             if echo "$STATUS" | grep -q '"status":"error"'; then
-              echo "❌ Model failed to load:"; echo "$STATUS"
-              tail -n 60 server.log || true; exit 1
+              echo "❌ All models failed to load:"
+              echo "$STATUS"
+              tail -n 80 server.log || true
+              exit 1
+            fi
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "  ... still loading (${i}/90) — $STATUS"
             fi
             sleep 2
           done
+
           echo "$STATUS"
-          echo "$STATUS" | grep -q '"status":"ok"' || { tail -n 60 server.log; exit 1; }
+          if ! echo "$STATUS" | grep -q '"status":"ok"'; then
+            echo "❌ Models never became healthy"
+            tail -n 100 server.log || true
+            exit 1
+          fi
+
+          # show partial-load warnings (some models failed but at least one is OK)
+          echo "$STATUS" | grep -q '"errors":{}' || echo "⚠ Some models failed (partial ensemble): $STATUS"
 
       - name: Start Cloudflare Quick Tunnel
         run: |
           nohup ./cloudflared tunnel --url http://localhost:8000 --no-autoupdate > tunnel.log 2>&1 &
+          echo "Waiting for trycloudflare URL..."
           URL=""
           for i in $(seq 1 60); do
             URL=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" tunnel.log | head -n1 || true)
             [ -n "$URL" ] && break
             sleep 2
           done
-          [ -z "$URL" ] && { echo "❌ No tunnel URL"; cat tunnel.log; exit 1; }
+
+          if [ -z "$URL" ]; then
+            echo "❌ Could not obtain tunnel URL"
+            cat tunnel.log
+            exit 1
+          fi
+
           echo "PUBLIC_URL=$URL" >> $GITHUB_ENV
-          echo "### 🌐 PolyGuard is live at: $URL" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 PolyGuard Ensemble is live at: $URL" >> $GITHUB_STEP_SUMMARY
           echo "🔗 $URL"
 
       - name: Keep service alive
         env:
-          POLYGUARD_MODEL_DIR: ${{ env.MODEL_DIR }}
+          MODELS_ROOT: ${{ env.MODELS_ROOT }}
         run: |
-          echo "Running at: $PUBLIC_URL"
+          echo "Service running at: $PUBLIC_URL"
+          echo "Will self-terminate after ~5 hours."
           for i in $(seq 1 300); do
             sleep 60
             pgrep -f "uvicorn app.main:app" >/dev/null || {
               echo "⚠ Uvicorn died, restarting..."
-              POLYGUARD_MODEL_DIR="$POLYGUARD_MODEL_DIR" \
+              MODELS_ROOT="$MODELS_ROOT" \
                 nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 >> server.log 2>&1 &
             }
             pgrep -f "cloudflared tunnel" >/dev/null || {
