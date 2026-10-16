@@ -10,7 +10,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # ---- 5-model roster ----
   PERSIAN_MODEL_ID:      HamidRezaei/Persian-Offensive-Language-Detection
   TEXTDETOX_LARGE_ID:    textdetox/twitter-xlmr-toxicity-classifier
   TEXTDETOX_BASE_ID:     textdetox/xlmr-base-toxicity-classifier
@@ -19,7 +18,6 @@ env:
 
   MODELS_ROOT: ${{ github.workspace }}/models
 
-  # ---- CONCURRENCY: 1 thread per inference ----
   OMP_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
   OPENBLAS_NUM_THREADS: "1"
@@ -80,7 +78,8 @@ jobs:
 
           # ==================================================================
           # BACKEND — preload-friendly, thread-safe, concurrency-safe,
-          # Fingilish → Persian transliteration, dual analysis, global errors
+          # Fingilish → Persian transliteration, dual analysis,
+          # FIXED: no circular refs (no more RecursionError)
           # ==================================================================
           cat > app/main.py << 'PYEOF'
           import os
@@ -104,9 +103,9 @@ jobs:
           torch.set_num_threads(1)
 
           from anyio import to_thread
-          from fastapi import FastAPI, Request
+          from fastapi import FastAPI
           from fastapi.staticfiles import StaticFiles
-          from fastapi.responses import FileResponse, JSONResponse
+          from fastapi.responses import FileResponse
           from pydantic import BaseModel
           from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
@@ -148,14 +147,12 @@ jobs:
           # FINGILISH → PERSIAN TRANSLITERATION (letters only, no words)
           # ==================================================================
           FINGILISH_TO_PERSIAN = [
-              # multi-char combos FIRST
               ('kh', 'خ'), ('gh', 'ق'), ('ch', 'چ'), ('sh', 'ش'), ('zh', 'ژ'),
               ('aa', 'آ'), ('ee', 'ی'), ('oo', 'و'), ('ou', 'و'), ('ei', 'ی'),
               ('ay', 'ی'), ('ey', 'ی'), ('ck', 'ک'), ('ph', 'ف'), ('th', 'ت'),
               ('ss', 'س'), ('tt', 'ت'), ('nn', 'ن'), ('mm', 'م'), ('ll', 'ل'),
               ('rr', 'ر'), ('dd', 'د'), ('bb', 'ب'), ('pp', 'پ'), ('kk', 'ک'),
               ('gg', 'گ'),
-              # single chars
               ('a', 'ا'), ('b', 'ب'), ('c', 'ک'), ('d', 'د'), ('e', 'ه'),
               ('f', 'ف'), ('g', 'گ'), ('h', 'ه'), ('i', 'ی'), ('j', 'ج'),
               ('k', 'ک'), ('l', 'ل'), ('m', 'م'), ('n', 'ن'), ('o', 'و'),
@@ -166,16 +163,11 @@ jobs:
 
 
           def _fingilish_to_persian(text: str) -> str:
-              """Transliterate Latin (Fingilish) into Persian letters.
-              Letters only — no dictionary, no profanity list."""
               t = text.lower().strip()
-              # strip decoration between letters: k.i.r → kir
               t = re.sub(r'[.\-_*^•]+', '', t)
-              # collapse single-letter tokens: "k i r" → "kir"
               tokens = t.split()
               if len(tokens) > 1 and all(len(tok) == 1 and tok.isalpha() for tok in tokens):
                   t = ''.join(tokens)
-
               result = []
               i = 0
               n = len(t)
@@ -194,7 +186,7 @@ jobs:
 
 
           # ==================================================================
-          # MODEL LOADING — runs at import time → compatible with gunicorn --preload
+          # MODEL LOADING — at import time → works with gunicorn --preload
           # ==================================================================
           def _load_one(name, spec):
               try:
@@ -223,7 +215,6 @@ jobs:
                     f"Errors: {list(state['errors'].keys())}", flush=True)
 
 
-          # Load at import time so gunicorn --preload shares via COW.
           _bootstrap()
 
 
@@ -261,7 +252,7 @@ jobs:
 
 
           # ==================================================================
-          # ENSEMBLE VOTING (single script pass)
+          # ENSEMBLE VOTING — pure function, returns a fresh dict
           # ==================================================================
           def _run_ensemble(text: str, script: str) -> Dict:
               models_snapshot = list(state["models"].items())
@@ -288,7 +279,10 @@ jobs:
                   labels_en[name] = label_en
 
               if not raw:
-                  return {"error": "no models applicable", "details": state["errors"]}
+                  return {
+                      "error": "no models applicable",
+                      "details": dict(state["errors"]),
+                  }
 
               votes = {name: (s >= PER_MODEL_VOTE_THRESHOLD) for name, s in raw.items()}
               votes_count  = sum(votes.values())
@@ -307,7 +301,7 @@ jobs:
                   decision = "SAFE"
 
               top2 = sorted(raw.values(), reverse=True)[:2]
-              confidence = round(sum(top2) / len(top2), 4)
+              confidence = round(sum(top2) / len(top2), 4) if top2 else 0.0
 
               return {
                   "decision":        decision,
@@ -325,7 +319,7 @@ jobs:
                   "script":          script,
                   "vote_threshold":  PER_MODEL_VOTE_THRESHOLD,
                   "min_votes":       MIN_VOTES_FOR_TOXIC,
-                  "errors":          state["errors"],
+                  "errors":          dict(state["errors"]),   # copy, not ref
               }
 
 
@@ -333,6 +327,21 @@ jobs:
           # DUAL ANALYSIS — original text + Fingilish-transliterated text
           # ==================================================================
           _ORDER = {"SAFE": 0, "SUSPECT": 1, "TOXIC": 2}
+
+
+          def _summary_of(result: Dict) -> Dict:
+              """Small flat copy — MUST NOT contain the parent dict (no circular refs)."""
+              if not result or "decision" not in result:
+                  return {"error": result.get("error") if result else "no result"}
+              return {
+                  "decision":     result["decision"],
+                  "confidence":   result["confidence"],
+                  "max_raw":      result["max_raw"],
+                  "votes_count":  result["votes_count"],
+                  "total_models": result["total_models"],
+                  "script":       result["script"],
+              }
+
 
           def ensemble_predict(text: str) -> Dict:
               t0 = time.perf_counter()
@@ -347,31 +356,38 @@ jobs:
                   persian_text.strip() != ""
               )
 
-              # run original
               result_original = _run_ensemble(text, script_original)
 
-              # run transliterated (only if it looks like Persian now)
               result_fingilish = None
               if has_fingilish:
                   result_fingilish = _run_ensemble(persian_text, script_persian)
 
-              # pick stronger decision
-              candidates = [r for r in (result_original, result_fingilish) if r and "decision" in r]
+              candidates = [r for r in (result_original, result_fingilish)
+                            if r and "decision" in r]
               if not candidates:
-                  return {"error": "no models applicable", "details": state["errors"]}
+                  return {
+                      "error": "no models applicable",
+                      "details": dict(state["errors"]),
+                  }
 
-              final_decision = max(candidates, key=lambda r: _ORDER.get(r["decision"], 0))["decision"]
+              final_decision = max(candidates,
+                                   key=lambda r: _ORDER.get(r["decision"], 0))["decision"]
 
-              primary = next((r for r in candidates if r["decision"] == final_decision), candidates[0])
-              primary["decision"]           = final_decision
-              primary["fingilish_detected"] = has_fingilish
-              primary["fingilish_text"]     = persian_text if has_fingilish else None
-              primary["analysis"] = {
-                  "original":  result_original,
-                  "fingilish": result_fingilish,
+              # Build a completely fresh response dict — no shared mutable refs.
+              primary = next((r for r in candidates if r["decision"] == final_decision),
+                             candidates[0])
+
+              response = dict(primary)                       # shallow copy
+              response.pop("analysis", None)                 # never carry stale nesting
+              response["decision"]           = final_decision
+              response["fingilish_detected"] = has_fingilish
+              response["fingilish_text"]     = persian_text if has_fingilish else None
+              response["analysis"] = {
+                  "original":  _summary_of(result_original),
+                  "fingilish": _summary_of(result_fingilish) if result_fingilish else None,
               }
-              primary["latency_ms"] = round((time.perf_counter() - t0) * 1000)
-              return primary
+              response["latency_ms"] = round((time.perf_counter() - t0) * 1000)
+              return response
 
 
           # ==================================================================
@@ -388,23 +404,13 @@ jobs:
                     f"threadpool={MAX_THREADPOOL_TOKENS}", flush=True)
 
 
-          @app.exception_handler(Exception)
-          async def _global_exc(request: Request, exc: Exception):
-              tb = traceback.format_exc()
-              print(f"[Ensemble] UNHANDLED:\n{tb}", flush=True)
-              return JSONResponse(
-                  status_code=500,
-                  content={"error": f"{type(exc).__name__}: {exc}"},
-              )
-
-
           @app.get("/health")
           def health():
               return {
                   "status": "ok" if state["ready"] and state["models"] else
                             ("loading" if not state["ready"] else "error"),
                   "loaded_models": list(state["models"].keys()),
-                  "errors": state["errors"],
+                  "errors": dict(state["errors"]),
                   "inflight": state["inflight"],
                   "peak": state["peak"],
                   "concurrency": MAX_CONCURRENT_INFERENCES,
@@ -413,7 +419,6 @@ jobs:
 
           @app.post("/api/check")
           def check(data: TextIn):
-              # Whole handler wrapped: no raw 500s can escape to Cloudflare.
               try:
                   if not state["ready"] or not state["models"]:
                       return {"error": state["errors"] or "no models loaded yet"}
@@ -429,7 +434,7 @@ jobs:
               except Exception as exc:
                   tb = traceback.format_exc()
                   print(f"[Ensemble] /api/check EXC:\n{tb}", flush=True)
-                  return {"error": f"server exception: {type(exc).__name__}: {exc}"}
+                  return {"error": f"{type(exc).__name__}: {exc}"}
 
 
           @app.get("/")
@@ -533,15 +538,12 @@ jobs:
 
           <body class="bg-token-main text-token-primary h-screen w-screen overflow-hidden flex antialiased selection:bg-emerald-500/20">
 
-              <!-- Mobile Backdrop -->
               <div id="mobile-backdrop" onclick="toggleSidebar()"
                    class="fixed inset-0 bg-black/50 z-30 hidden md:hidden transition-opacity"></div>
 
-              <!-- ================= LEFT/RIGHT COLLAPSIBLE SIDEBAR (ChatGPT #171717) ================= -->
               <aside id="sidebar"
                      class="fixed md:static inset-y-0 right-0 z-40 w-[260px] bg-token-sidebar flex flex-col transition-all duration-200 ease-in-out shrink-0 transform translate-x-full md:translate-x-0 border-l border-token-border select-none">
 
-                  <!-- Sidebar Top Bar (Collapse + New Chat Icons) -->
                   <div class="h-14 px-3 flex items-center justify-between">
                       <button onclick="toggleSidebar()"
                               class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
@@ -551,7 +553,6 @@ jobs:
                               <line x1="15" y1="3" x2="15" y2="21"></line>
                           </svg>
                       </button>
-
                       <div class="flex items-center gap-1">
                           <button onclick="toggleSearchInput()"
                                   class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
@@ -566,7 +567,6 @@ jobs:
                       </div>
                   </div>
 
-                  <!-- Search Drawer (Hidden by default) -->
                   <div id="sidebar-search-box" class="px-3 pb-2 hidden">
                       <div class="relative">
                           <i class="fa-solid fa-magnifying-glass absolute right-3 top-1/2 -translate-y-1/2 text-xs text-token-tertiary"></i>
@@ -576,7 +576,6 @@ jobs:
                       </div>
                   </div>
 
-                  <!-- Pinned Brand / GPT Item -->
                   <div class="px-2 pb-1">
                       <button onclick="createNewThread()"
                               class="w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-sm text-token-primary hover:bg-token-hover transition-colors group">
@@ -588,7 +587,6 @@ jobs:
                           </div>
                           <i class="fa-regular fa-pen-to-square text-xs text-token-tertiary opacity-0 group-hover:opacity-100 transition-opacity"></i>
                       </button>
-
                       <button onclick="openModelsModal()"
                               class="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[13px] text-token-secondary hover:bg-token-hover transition-colors">
                           <div class="w-6 h-6 rounded-full flex items-center justify-center text-xs text-token-secondary">
@@ -598,17 +596,13 @@ jobs:
                       </button>
                   </div>
 
-                  <!-- Chronological Chat Threads List -->
                   <div id="threads-list" class="flex-1 overflow-y-auto px-2 py-2 space-y-4"></div>
 
-                  <!-- Sidebar Footer: Live Model Status + User Profile Pill -->
                   <div class="p-2 border-t border-token-border space-y-1">
                       <div onclick="openSettingsModal()"
                            class="flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-token-hover cursor-pointer transition-colors">
                           <div class="flex items-center gap-2.5 min-w-0">
-                              <div class="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 text-white flex items-center justify-center text-xs font-bold shrink-0">
-                                  PG
-                              </div>
+                              <div class="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 text-white flex items-center justify-center text-xs font-bold shrink-0">PG</div>
                               <div class="truncate">
                                   <div class="text-[13px] font-medium text-token-primary leading-tight truncate">PolyGuard Core</div>
                                   <div class="flex items-center gap-1.5 mt-0.5">
@@ -622,13 +616,9 @@ jobs:
                   </div>
               </aside>
 
-              <!-- ================= CENTRAL CHAT WORKSPACE (ChatGPT #212121) ================= -->
               <main class="flex-1 flex flex-col h-full min-w-0 bg-token-main relative">
-
-                  <!-- Top Sticky Header -->
                   <header class="h-14 px-3 sm:px-4 flex items-center justify-between shrink-0 z-20">
                       <div class="flex items-center gap-1">
-                          <!-- Show when sidebar is collapsed on desktop or mobile -->
                           <button id="open-sidebar-btn" onclick="toggleSidebar()"
                                   class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors md:hidden"
                                   title="باز کردن نوار کناری">
@@ -643,7 +633,6 @@ jobs:
                               <i class="fa-regular fa-pen-to-square text-sm"></i>
                           </button>
 
-                          <!-- ChatGPT Model Selector Dropdown Button -->
                           <div class="relative">
                               <button onclick="toggleModelDropdown(event)"
                                       class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-base font-semibold text-token-primary hover:bg-token-hover transition-colors">
@@ -651,8 +640,6 @@ jobs:
                                   <span class="text-token-secondary font-normal text-sm">5-Ensemble</span>
                                   <i class="fa-solid fa-chevron-down text-[11px] text-token-tertiary mr-0.5"></i>
                               </button>
-
-                              <!-- Dropdown Menu -->
                               <div id="model-dropdown"
                                    class="hidden absolute right-0 mt-1.5 w-72 bg-token-surface border border-token-border rounded-2xl shadow-2xl p-1.5 z-50 animate-fadeIn">
                                   <div class="px-3 py-1.5 text-[11px] text-token-tertiary font-medium">معماری تشخیص</div>
@@ -682,7 +669,6 @@ jobs:
                           </div>
                       </div>
 
-                      <!-- Top-Left Utility Buttons -->
                       <div class="flex items-center gap-1">
                           <button onclick="exportCurrentThread()"
                                   class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
@@ -697,11 +683,8 @@ jobs:
                       </div>
                   </header>
 
-                  <!-- Scrollable Messages Stream -->
                   <div id="messages-container" class="flex-1 overflow-y-auto px-4 scroll-smooth">
                       <div class="max-w-[48rem] mx-auto min-h-full flex flex-col">
-
-                          <!-- Empty State (ChatGPT Centered Greeting) -->
                           <div id="welcome-screen" class="my-auto py-10 flex flex-col items-center justify-center text-center">
                               <div class="w-12 h-12 rounded-full bg-token-primary text-token-main flex items-center justify-center text-xl mb-5 shadow-sm">
                                   <i class="fa-solid fa-shield-halved"></i>
@@ -710,7 +693,6 @@ jobs:
                                   چه متنی را برایتان بررسی کنم؟
                               </h1>
 
-                              <!-- Starter Pills Grid -->
                               <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full max-w-2xl text-right">
                                   <button onclick="useStarter('سلام وقت بخیر، از همکاری با شما بسیار خوشحالم.')"
                                           class="group px-4 py-3 rounded-2xl border border-token-border bg-transparent hover:bg-token-surface transition-colors flex flex-col gap-1">
@@ -750,16 +732,13 @@ jobs:
                               </div>
                           </div>
 
-                          <!-- Active Thread Conversation Stream -->
                           <div id="chat-stream" class="space-y-6 py-6 hidden"></div>
                       </div>
                   </div>
 
-                  <!-- ================= BOTTOM FLOATING PROMPT COMPOSER (ChatGPT #2f2f2f) ================= -->
                   <div class="w-full px-4 pb-3 pt-1 bg-token-main shrink-0">
                       <div class="max-w-[48rem] mx-auto">
                           <div class="relative flex flex-col bg-token-surface rounded-[26px] border border-token-border px-3.5 py-2.5 shadow-sm focus-within:border-gray-400/40 dark:focus-within:border-white/20 transition-colors">
-
                               <textarea id="prompt-input" rows="1"
                                         placeholder="متن خود را برای تحلیل PolyGuard بنویسید..."
                                         oninput="autoResize(this)"
@@ -768,7 +747,6 @@ jobs:
                                         dir="auto"></textarea>
 
                               <div class="flex items-center justify-between pt-2 px-0.5">
-                                  <!-- Left/Right Composer Pill Actions -->
                                   <div class="flex items-center gap-1.5">
                                       <button onclick="pasteClipboard()"
                                               class="h-8 px-2.5 rounded-full border border-token-border text-xs text-token-secondary hover:bg-token-hover flex items-center gap-1.5 transition-colors"
@@ -782,8 +760,6 @@ jobs:
                                           <span>۵ مدل فعال</span>
                                       </button>
                                   </div>
-
-                                  <!-- Send Button (ChatGPT Monochrome Circle) -->
                                   <div class="flex items-center gap-2.5">
                                       <span id="char-counter" class="text-[11px] text-token-tertiary font-mono hidden"></span>
                                       <button id="send-btn" onclick="analyze()" disabled
@@ -793,7 +769,6 @@ jobs:
                                   </div>
                               </div>
                           </div>
-
                           <div class="text-center mt-2">
                               <p class="text-[11px] text-token-tertiary">
                                   PolyGuard Ensemble از ۵ مدل زبانی با رأی‌گیری اجماعی استفاده می‌کند. فینگیلیش نیز به‌صورت خودکار ترنسلیت می‌شود.
@@ -803,7 +778,6 @@ jobs:
                   </div>
               </main>
 
-              <!-- ================= SETTINGS & ENSEMBLE MODAL ================= -->
               <div id="settings-modal" onclick="if(event.target===this)closeSettingsModal()"
                    class="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 hidden items-center justify-center p-4">
                   <div class="bg-token-surface border border-token-border rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 animate-fadeIn">
@@ -854,7 +828,6 @@ jobs:
                   </div>
               </div>
 
-              <!-- Toast Notification -->
               <div id="toast" class="fixed top-4 left-1/2 -translate-x-1/2 z-50 hidden bg-token-primary text-token-main px-4 py-2 rounded-full shadow-lg text-xs font-medium items-center gap-2">
                   <i class="fa-solid fa-check text-emerald-500"></i>
                   <span id="toast-message">انجام شد</span>
@@ -872,7 +845,7 @@ jobs:
           const STORAGE_KEY = 'polyguard_chatgpt_threads_v3';
 
           const state = {
-            threads: [],       // [{ id, title, createdAt, updatedAt, messages: [{ id, text, result, ts }] }]
+            threads: [],
             activeThreadId: null,
             sidebarOpen: true,
             isAnalyzing: false,
@@ -896,9 +869,6 @@ jobs:
             });
           };
 
-          /**************************************************************
-           * STORAGE & MIGRATION
-           **************************************************************/
           function loadState() {
             try {
               const raw = localStorage.getItem(STORAGE_KEY);
@@ -908,9 +878,7 @@ jobs:
                 state.activeThreadId = parsed.activeThreadId || null;
                 state.viewMode = parsed.viewMode || 'detailed';
               }
-            } catch (e) {
-              console.warn(e);
-            }
+            } catch (e) { console.warn(e); }
             updateViewModeCheckmarks();
           }
 
@@ -921,14 +889,9 @@ jobs:
                 activeThreadId: state.activeThreadId,
                 viewMode: state.viewMode
               }));
-            } catch (e) {
-              console.warn(e);
-            }
+            } catch (e) { console.warn(e); }
           }
 
-          /**************************************************************
-           * SERVER HEALTH
-           **************************************************************/
           async function checkHealth() {
             const dot = document.getElementById('status-dot');
             const txt = document.getElementById('status-text');
@@ -964,16 +927,12 @@ jobs:
             }
           }
 
-          /**************************************************************
-           * SIDEBAR & NAVIGATION
-           **************************************************************/
           function toggleSidebar() {
             const sidebar = document.getElementById('sidebar');
             const backdrop = document.getElementById('mobile-backdrop');
             const openBtn = document.getElementById('open-sidebar-btn');
             const newChatTopBtn = document.getElementById('new-chat-top-btn');
             const isMobile = window.innerWidth < 768;
-
             if (isMobile) {
               const hidden = sidebar.classList.contains('translate-x-full');
               if (hidden) {
@@ -1071,12 +1030,7 @@ jobs:
 
             const now = Date.now();
             const oneDay = 86400000;
-            const groups = {
-              'امروز': [],
-              '۷ روز گذشته': [],
-              'قدیمی‌تر': []
-            };
-
+            const groups = { 'امروز': [], '۷ روز گذشته': [], 'قدیمی‌تر': [] };
             filtered.forEach(t => {
               const age = now - (t.updatedAt || t.createdAt || now);
               if (age < oneDay) groups['امروز'].push(t);
@@ -1097,7 +1051,6 @@ jobs:
                   : lastMsg?.result?.decision === 'SUSPECT'
                   ? 'bg-amber-400'
                   : 'bg-emerald-500';
-
                 html += `
                   <div onclick="selectThread('${t.id}')"
                        class="group flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer text-[13px] transition-colors ${isActive ? 'bg-token-hover text-token-primary font-medium' : 'text-token-secondary hover:bg-token-hover/60 hover:text-token-primary'}">
@@ -1114,25 +1067,19 @@ jobs:
               });
               html += `</div>`;
             }
-
             container.innerHTML = html;
           }
 
-          /**************************************************************
-           * RENDER ACTIVE THREAD (MULTI-TURN CHATGPT STREAM)
-           **************************************************************/
           function renderActiveThread() {
             const welcome = document.getElementById('welcome-screen');
             const stream = document.getElementById('chat-stream');
             const thread = state.threads.find(t => t.id === state.activeThreadId);
-
             if (!thread || !thread.messages.length) {
               welcome.classList.remove('hidden');
               stream.classList.add('hidden');
               stream.innerHTML = '';
               return;
             }
-
             welcome.classList.add('hidden');
             stream.classList.remove('hidden');
             stream.innerHTML = thread.messages.map(m => buildTurnHTML(m)).join('');
@@ -1166,23 +1113,24 @@ jobs:
             const decisionMeta = {
               TOXIC: {
                 badgeBg: 'bg-rose-500/15 text-rose-500 border-rose-500/30',
-                barColor: 'bg-rose-500',
                 title: 'محتوای سمی شناسایی شد (TOXIC)',
                 summary: 'بر اساس رأی‌گیری اجماعی، این متن حاوی الفاظ توهین‌آمیز یا سمی تشخیص داده شد.'
               },
               SUSPECT: {
                 badgeBg: 'bg-amber-500/15 text-amber-500 border-amber-500/30',
-                barColor: 'bg-amber-500',
                 title: 'محتوای مشکوک — نیازمند بازبینی (SUSPECT)',
                 summary: 'برخی مدل‌ها احتمال سمیت متوسطی را تشخیص داده‌اند اما اجماع کامل وجود ندارد.'
               },
               SAFE: {
                 badgeBg: 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30',
-                barColor: 'bg-emerald-500',
                 title: 'محتوای سالم و محترمانه (SAFE)',
                 summary: 'هیچ‌یک از مدل‌های ensemble نشانه‌ای از توهین یا سمیت در این متن نیافتند.'
               }
-            }[r.decision];
+            }[r.decision] || {
+              badgeBg: 'bg-slate-500/15 text-slate-500 border-slate-500/30',
+              title: 'نتیجه نامشخص',
+              summary: 'پاسخ معتبر از سرور دریافت نشد.'
+            };
 
             const scriptLabel = r.script === 'fa' ? 'فارسی' : r.script === 'en' ? 'انگلیسی' : 'چندزبانه / مختلط';
 
@@ -1196,7 +1144,6 @@ jobs:
               const badge = voted
                 ? `<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-rose-500/15 text-rose-500">رأی سمی</span>`
                 : `<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/15 text-emerald-500">سالم</span>`;
-
               return `
                 <div class="py-2.5 border-b border-token-border last:border-0">
                   <div class="flex items-center justify-between gap-2 mb-1.5">
@@ -1245,15 +1192,11 @@ jobs:
             return `
               <article class="space-y-4 animate-fadeIn">
                 ${userHTML}
-
-                <!-- Assistant Response Row -->
                 <div class="flex items-start gap-3.5">
                   <div class="w-7 h-7 rounded-full border border-token-border bg-token-surface text-token-primary flex items-center justify-center text-xs shrink-0 mt-0.5">
                     <i class="fa-solid fa-shield-halved"></i>
                   </div>
-
                   <div class="flex-1 min-w-0 space-y-2">
-                    <!-- Main Verdict Card -->
                     <div class="border border-token-border bg-token-surface/40 rounded-2xl p-4">
                       ${fingilishNotice}
                       <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
@@ -1264,12 +1207,9 @@ jobs:
                           اطمینان: <strong>${(r.confidence * 100).toFixed(1)}%</strong>
                         </span>
                       </div>
-
                       <p class="text-[13.5px] text-token-secondary leading-relaxed mb-3">
                         ${decisionMeta.summary}
                       </p>
-
-                      <!-- Quick Metrics Pills -->
                       <div class="grid grid-cols-3 gap-2 text-center bg-token-main/60 p-2.5 rounded-xl border border-token-border">
                         <div>
                           <div class="text-[10px] text-token-tertiary">آرای سمیت</div>
@@ -1285,10 +1225,7 @@ jobs:
                         </div>
                       </div>
                     </div>
-
                     ${detailsSection}
-
-                    <!-- ChatGPT Message Action Bar -->
                     <div class="flex items-center gap-1 pt-0.5 text-token-tertiary">
                       <button onclick="copyReport('${msg.id}')"
                               class="p-1.5 rounded-lg hover:bg-token-hover hover:text-token-primary transition-colors text-xs flex items-center gap-1"
@@ -1311,9 +1248,6 @@ jobs:
               </article>`;
           }
 
-          /**************************************************************
-           * ANALYZE SUBMISSION
-           **************************************************************/
           async function analyze(overrideText) {
             const input = document.getElementById('prompt-input');
             const text = (typeof overrideText === 'string' ? overrideText : input.value).trim();
@@ -1321,13 +1255,11 @@ jobs:
 
             state.isAnalyzing = true;
             document.getElementById('send-btn').disabled = true;
-
             if (typeof overrideText !== 'string') {
               input.value = '';
               autoResize(input);
             }
 
-            // Ensure an active thread exists
             let thread = state.threads.find(t => t.id === state.activeThreadId);
             if (!thread) {
               thread = {
@@ -1349,13 +1281,9 @@ jobs:
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text })
               });
-
               let result;
-              try {
-                result = await r.json();
-              } catch (_) {
-                result = { error: `bad response (HTTP ${r.status})` };
-              }
+              try { result = await r.json(); }
+              catch (_) { result = { error: `bad response (HTTP ${r.status})` }; }
 
               const msgObj = {
                 id: 'msg_' + Date.now(),
@@ -1384,7 +1312,6 @@ jobs:
             const stream = document.getElementById('chat-stream');
             welcome.classList.add('hidden');
             stream.classList.remove('hidden');
-
             const pendingDiv = document.createElement('div');
             pendingDiv.id = 'pending-turn';
             pendingDiv.className = 'space-y-4 animate-fadeIn';
@@ -1414,9 +1341,6 @@ jobs:
             analyze(msg.text);
           }
 
-          /**************************************************************
-           * COMPOSER & UI HELPERS
-           **************************************************************/
           function autoResize(el) {
             el.style.height = 'auto';
             el.style.height = Math.min(el.scrollHeight, 176) + 'px';
@@ -1568,7 +1492,7 @@ jobs:
           }
           JSEOF
 
-          echo "✔ All ChatGPT-themed app files created"
+          echo "✔ All app files created"
           ls -R app
 
       - name: Install cloudflared
@@ -1579,8 +1503,6 @@ jobs:
 
       - name: Start FastAPI server (preloaded, multi-worker, no OOM)
         run: |
-          # --preload: models loaded ONCE in master, then forked via COW.
-          # Workers: 2 → RAM ~6-7 GB (fits in 16 GB).
           nohup gunicorn app.main:app \
               --workers 2 \
               --worker-class uvicorn.workers.UvicornWorker \
@@ -1611,15 +1533,20 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke tests (Fingilish + concurrency + RAM)
+      - name: Smoke tests (Fingilish + concurrency + RecursionError regression)
         run: |
           echo "=== health ==="
           curl -s http://localhost:8000/health | head -c 400
           echo
-          echo "=== Fingilish 'kir' ==="
+          echo "=== Fingilish 'kir' (expect TOXIC) ==="
           curl -s -X POST http://localhost:8000/api/check \
             -H 'Content-Type: application/json' \
             -d '{"text":"kir"}' | head -c 700
+          echo
+          echo "=== Short English 'hi' (regression test for RecursionError) ==="
+          curl -s -X POST http://localhost:8000/api/check \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"hi"}' | head -c 700
           echo
           echo "=== 8 parallel requests ==="
           time (
