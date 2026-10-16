@@ -1,4 +1,4 @@
-name: PolyGuard Ensemble — NexusAI UI + Cloudflare Tunnel
+name: PolyGuard Ensemble Web + Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 concurrency:
-  group: polyguard-nexusai-deploy
+  group: polyguard-deploy
   cancel-in-progress: true
 
 env:
@@ -18,9 +18,8 @@ env:
   TWITTER_OFFENSIVE_ID:  cardiffnlp/twitter-roberta-base-offensive
 
   MODELS_ROOT: ${{ github.workspace }}/models
-  TOXIC_THRESHOLD:   "0.05"
-  SUSPECT_THRESHOLD: "0.02"
 
+  # CPU tuning for 4-core / 16GB runner
   OMP_NUM_THREADS: "4"
   MKL_NUM_THREADS: "4"
   TOKENIZERS_PARALLELISM: "false"
@@ -77,9 +76,9 @@ jobs:
         run: |
           mkdir -p app/static
 
-          # ============================================================
-          # BACKEND — FastAPI + 5-model weighted ensemble
-          # ============================================================
+          # ==================================================================
+          # BACKEND — FastAPI + consensus voting + language-aware routing
+          # ==================================================================
           cat > app/main.py << 'PYEOF'
           import os
           os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -88,6 +87,7 @@ jobs:
           os.environ.setdefault("OMP_NUM_THREADS", "4")
           os.environ.setdefault("MKL_NUM_THREADS", "4")
 
+          import re
           import threading
           from contextlib import asynccontextmanager
           from pathlib import Path
@@ -104,31 +104,37 @@ jobs:
           BASE_DIR    = Path(__file__).resolve().parent
           MODELS_ROOT = Path(os.environ["MODELS_ROOT"])
 
-          TOXIC_THRESHOLD   = float(os.environ.get("TOXIC_THRESHOLD",   "0.05"))
-          SUSPECT_THRESHOLD = float(os.environ.get("SUSPECT_THRESHOLD", "0.02"))
-
           class TextIn(BaseModel):
               text: str
 
           state = {"models": {}, "errors": {}, "ready": False}
 
           MODEL_SPECS = {
-              "persian":      {"dir": MODELS_ROOT / "persian",           "mode": "multilabel", "weight": 2.0, "label": "Persian ParsBERT (تخصصی فارسی)"},
-              "textdetox_lg": {"dir": MODELS_ROOT / "textdetox_large",   "mode": "binary",     "weight": 2.0, "label": "TextDetox XLM-R Large (۱۵ زبان)"},
-              "textdetox_sm": {"dir": MODELS_ROOT / "textdetox_base",    "mode": "binary",     "weight": 1.5, "label": "TextDetox XLM-R Base (۱۵ زبان)"},
-              "multilingual": {"dir": MODELS_ROOT / "multilingual",      "mode": "multilabel", "weight": 1.0, "label": "Unitary XLM-R (چندزبانه ۱۰۰+)"},
-              "twitter_off":  {"dir": MODELS_ROOT / "twitter_offensive", "mode": "binary",     "weight": 1.0, "label": "Twitter RoBERTa Offensive"},
+              "persian":      {"dir": MODELS_ROOT / "persian",           "mode": "multilabel", "weight": 2.0, "lang": "fa",    "label": "Persian ParsBERT (تخصصی فارسی)",        "label_en": "Persian ParsBERT"},
+              "textdetox_lg": {"dir": MODELS_ROOT / "textdetox_large",   "mode": "binary",     "weight": 2.0, "lang": "multi", "label": "TextDetox XLM-R Large (۱۵ زبان)",       "label_en": "TextDetox XLM-R Large"},
+              "textdetox_sm": {"dir": MODELS_ROOT / "textdetox_base",    "mode": "binary",     "weight": 1.5, "lang": "multi", "label": "TextDetox XLM-R Base (۱۵ زبان)",        "label_en": "TextDetox XLM-R Base"},
+              "multilingual": {"dir": MODELS_ROOT / "multilingual",      "mode": "multilabel", "weight": 1.0, "lang": "multi", "label": "Unitary XLM-R (چندزبانه ۱۰۰+)",         "label_en": "Unitary XLM-R"},
+              "twitter_off":  {"dir": MODELS_ROOT / "twitter_offensive", "mode": "binary",     "weight": 1.0, "lang": "en",    "label": "Twitter RoBERTa Offensive (انگلیسی)",   "label_en": "Twitter RoBERTa Offensive"},
           }
+
+          # ---------- consensus rules ----------
+          PER_MODEL_VOTE_THRESHOLD = 0.50
+          MIN_VOTES_FOR_TOXIC      = 2
+          STRONG_SINGLE_MODEL      = 0.90
+          WEAK_SUSPECT_THRESHOLD   = 0.60
 
           def _load_one(name, spec):
               try:
-                  print(f"[Ensemble] Loading '{name}' from {spec['dir']}", flush=True)
+                  print(f"[Ensemble] Loading '{name}'", flush=True)
                   tok = AutoTokenizer.from_pretrained(str(spec["dir"]), local_files_only=True)
                   mdl = AutoModelForSequenceClassification.from_pretrained(
                       str(spec["dir"]), local_files_only=True
                   )
                   mdl.eval()
-                  state["models"][name] = (mdl, tok, spec["mode"], spec["weight"], spec["label"])
+                  state["models"][name] = (
+                      mdl, tok, spec["mode"], spec["weight"],
+                      spec["lang"], spec["label"], spec["label_en"]
+                  )
                   print(f"[Ensemble] ✔ '{name}' loaded", flush=True)
               except Exception as exc:
                   state["errors"][name] = str(exc)
@@ -155,41 +161,83 @@ jobs:
                   return float(probs.item())
               return float(probs[1].item())
 
+          def _detect_script(text: str) -> str:
+              fa = len(re.findall(r'[\u0600-\u06FF]', text))
+              en = len(re.findall(r'[A-Za-z]', text))
+              total = fa + en
+              if total == 0:
+                  return "mixed"
+              if fa / total >= 0.6:
+                  return "fa"
+              if en / total >= 0.6:
+                  return "en"
+              return "mixed"
+
           def ensemble_predict(text: str) -> Dict:
-              raw, weighted, labels = {}, {}, {}
-              for name, (mdl, tok, mode, weight, label) in state["models"].items():
+              script = _detect_script(text)
+
+              raw, weighted, labels, labels_en, skipped = {}, {}, {}, {}, []
+              for name, (mdl, tok, mode, weight, lang, label, label_en) in state["models"].items():
+                  # Skip English-only models on Persian text
+                  if script == "fa" and lang == "en":
+                      skipped.append(name)
+                      continue
+                  # Skip Persian-only model on pure English text
+                  if script == "en" and lang == "fa":
+                      skipped.append(name)
+                      continue
+
                   try:
                       s = _score_binary(mdl, tok, text) if mode == "binary" \
                           else _score_multilabel(mdl, tok, text)
                   except Exception as exc:
                       print(f"[Ensemble] inference error in {name}: {exc}", flush=True)
                       s = 0.0
-                  raw[name]      = round(s, 4)
-                  weighted[name] = round(s * weight, 4)
-                  labels[name]   = label
 
-              if not weighted:
-                  return {"error": "no models loaded", "details": state["errors"]}
+                  raw[name]        = round(s, 4)
+                  weighted[name]   = round(s * weight, 4)
+                  labels[name]     = label
+                  labels_en[name]  = label_en
 
+              if not raw:
+                  return {"error": "no models applicable", "details": state["errors"]}
+
+              votes = {name: (s >= PER_MODEL_VOTE_THRESHOLD) for name, s in raw.items()}
+              votes_count  = sum(votes.values())
+              max_raw      = max(raw.values())
               max_weighted = max(weighted.values())
 
-              if max_weighted >= TOXIC_THRESHOLD:
+              if votes_count >= MIN_VOTES_FOR_TOXIC:
                   decision = "TOXIC"
-              elif max_weighted >= SUSPECT_THRESHOLD:
+              elif votes_count == 1 and max_raw >= STRONG_SINGLE_MODEL:
+                  decision = "TOXIC"
+              elif votes_count == 1 and max_raw >= WEAK_SUSPECT_THRESHOLD:
+                  decision = "SUSPECT"
+              elif max_raw >= WEAK_SUSPECT_THRESHOLD:
                   decision = "SUSPECT"
               else:
                   decision = "SAFE"
 
+              top2 = sorted(raw.values(), reverse=True)[:2]
+              confidence = round(sum(top2) / len(top2), 4)
+
               return {
-                  "decision":          decision,
-                  "max_weighted":      round(max_weighted, 4),
-                  "raw_scores":        raw,
-                  "weighted_scores":   weighted,
-                  "labels":            labels,
-                  "total_models":      len(weighted),
-                  "toxic_threshold":   TOXIC_THRESHOLD,
-                  "suspect_threshold": SUSPECT_THRESHOLD,
-                  "errors":            state["errors"],
+                  "decision":         decision,
+                  "max_weighted":     round(max_weighted, 4),
+                  "max_raw":          round(max_raw, 4),
+                  "confidence":       confidence,
+                  "votes_count":      votes_count,
+                  "votes":            votes,
+                  "raw_scores":       raw,
+                  "weighted_scores":  weighted,
+                  "labels":           labels,
+                  "labels_en":        labels_en,
+                  "total_models":     len(raw),
+                  "skipped_models":   skipped,
+                  "script":           script,
+                  "vote_threshold":   PER_MODEL_VOTE_THRESHOLD,
+                  "min_votes":        MIN_VOTES_FOR_TOXIC,
+                  "errors":           state["errors"],
               }
 
           @asynccontextmanager
@@ -209,8 +257,6 @@ jobs:
                   "status": "ok",
                   "loaded_models": list(state["models"].keys()),
                   "errors": state["errors"],
-                  "toxic_threshold": TOXIC_THRESHOLD,
-                  "suspect_threshold": SUSPECT_THRESHOLD,
               }
 
           @app.post("/api/check")
@@ -226,16 +272,17 @@ jobs:
           app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
           PYEOF
 
-          # ============================================================
-          # FRONTEND — NexusAI-style HTML
-          # ============================================================
+          # ==================================================================
+          # FRONTEND — HTML (NexusAI-style + Vazirmatn Persian font)
+          # ==================================================================
           cat > app/static/index.html << 'HTMLEOF'
           <!DOCTYPE html>
-          <html lang="fa" class="dark">
+          <html lang="fa" dir="rtl" class="dark">
           <head>
               <meta charset="UTF-8">
               <meta name="viewport" content="width=device-width, initial-scale=1.0">
               <title>PolyGuard Ensemble — تشخیص محتوای سمی</title>
+
               <script src="https://cdn.tailwindcss.com"></script>
               <script>
                   tailwind.config = {
@@ -245,32 +292,49 @@ jobs:
                               colors: {
                                   gpt: {
                                       sidebar: '#171717',
-                                      main: '#212121',
-                                      input: '#2f2f2f',
-                                      hover: '#2a2b32',
-                                      border: '#383838',
+                                      main:    '#212121',
+                                      input:   '#2f2f2f',
+                                      hover:   '#2a2b32',
+                                      border:  '#383838',
                                       userBubble: '#2f2f2f',
-                                      accent: '#10a37f'
+                                      accent:  '#10a37f'
                                   }
                               },
                               fontFamily: {
-                                  sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
+                                  sans: ['Vazirmatn', 'Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Tahoma', 'sans-serif'],
+                                  fa:   ['Vazirmatn', 'Tahoma', 'sans-serif'],
                                   mono: ['Fira Code', 'JetBrains Mono', 'Consolas', 'monospace']
                               }
                           }
                       }
                   }
               </script>
-              <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+
+              <!-- Persian font: Vazirmatn (Google Fonts) -->
+              <link rel="preconnect" href="https://fonts.googleapis.com">
+              <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+              <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+
               <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
               <style>
+                  * { font-family: 'Vazirmatn', 'Inter', Tahoma, sans-serif; }
+                  .font-mono, code, pre { font-family: 'Fira Code', monospace !important; }
+
                   ::-webkit-scrollbar { width: 6px; height: 6px; }
                   ::-webkit-scrollbar-track { background: transparent; }
-                  ::-webkit-scrollbar-thumb { background: rgba(156, 163, 175, 0.3); border-radius: 9999px; }
-                  ::-webkit-scrollbar-thumb:hover { background: rgba(156, 163, 175, 0.5); }
+                  ::-webkit-scrollbar-thumb { background: rgba(156,163,175,.3); border-radius: 9999px; }
+                  ::-webkit-scrollbar-thumb:hover { background: rgba(156,163,175,.5); }
 
-                  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-                  .animate-fadeIn { animation: fadeIn 0.25s ease-out; }
+                  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+                  .animate-fadeIn { animation: fadeIn .28s ease both; }
+
+                  @keyframes pulseRing {
+                      0%   { box-shadow: 0 0 0 0 rgba(239,68,68,.5); }
+                      70%  { box-shadow: 0 0 0 14px rgba(239,68,68,0); }
+                      100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+                  }
+                  .pulse-ring { animation: pulseRing 1.6s infinite; }
 
                   .typing-dot { animation: typingBounce 1.4s infinite ease-in-out both; }
                   .typing-dot:nth-child(1) { animation-delay: -0.32s; }
@@ -280,31 +344,35 @@ jobs:
                       40% { transform: scale(1); opacity: 1; }
                   }
 
-                  /* Score bar animations */
-                  .score-bar { transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1); }
+                  .score-bar { transition: width .8s cubic-bezier(.2,.7,.2,1); }
 
-                  /* RTL text for Persian input */
-                  .rtl { direction: rtl; text-align: right; }
+                  /* Persian digits feel more natural */
+                  .fa-num { font-feature-settings: "ss01"; }
               </style>
           </head>
           <body class="bg-white dark:bg-gpt-main text-gray-800 dark:text-gray-100 font-sans antialiased h-screen w-screen overflow-hidden flex select-none">
 
-              <!-- Mobile Backdrop -->
-              <div id="mobile-backdrop" onclick="toggleSidebar()" class="fixed inset-0 bg-black/60 z-30 hidden md:hidden backdrop-blur-xs"></div>
+              <div id="mobile-backdrop" onclick="toggleSidebar()"
+                   class="fixed inset-0 bg-black/60 z-30 hidden md:hidden backdrop-blur-sm"></div>
 
               <!-- ============ SIDEBAR ============ -->
-              <aside id="sidebar" class="fixed md:static inset-y-0 left-0 z-40 w-[260px] bg-gray-50 dark:bg-gpt-sidebar border-r border-gray-200 dark:border-white/10 flex flex-col transition-all duration-300 ease-in-out shrink-0 transform -translate-x-full md:translate-x-0">
+              <aside id="sidebar"
+                     class="fixed md:static inset-y-0 right-0 z-40 w-[260px] bg-gray-50 dark:bg-gpt-sidebar border-l border-gray-200 dark:border-white/10 flex flex-col transition-all duration-300 ease-in-out shrink-0 transform translate-x-full md:translate-x-0">
 
                   <div class="p-3 flex items-center justify-between gap-2">
-                      <button onclick="toggleSidebar()" class="p-2.5 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors">
-                          <i class="fa-solid fa-table-columns text-base"></i>
+                      <button onclick="toggleSidebar()"
+                              class="p-2.5 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors"
+                              title="بستن نوار کناری">
+                          <i class="fa-solid fa-table-columns"></i>
                       </button>
-                      <button onclick="createNewAnalysis()" class="flex-1 flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors">
+
+                      <button onclick="createNewAnalysis()"
+                              class="flex-1 flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors">
                           <span class="flex items-center gap-2.5">
                               <span class="w-6 h-6 rounded-full bg-gpt-accent text-white flex items-center justify-center text-xs">
                                   <i class="fa-solid fa-shield-halved"></i>
                               </span>
-                              <span>New analysis</span>
+                              <span>تحلیل جدید</span>
                           </span>
                           <i class="fa-regular fa-pen-to-square text-gray-400"></i>
                       </button>
@@ -312,19 +380,30 @@ jobs:
 
                   <div class="px-3 pb-2">
                       <div class="relative">
-                          <i class="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-xs text-gray-400"></i>
-                          <input id="search-chats" type="text" oninput="renderHistoryList()" placeholder="Search history..." class="w-full bg-gray-200/70 dark:bg-white/5 text-xs text-gray-800 dark:text-gray-200 placeholder-gray-400 pl-8 pr-3 py-2 rounded-lg focus:outline-none focus:ring-1 focus:ring-gpt-accent transition">
+                          <i class="fa-solid fa-magnifying-glass absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-400"></i>
+                          <input id="search-scans" type="text" oninput="renderHistoryList()"
+                                 placeholder="جستجو در تاریخچه..."
+                                 class="w-full bg-gray-200/70 dark:bg-white/5 text-xs text-gray-800 dark:text-gray-200 placeholder-gray-400 pr-8 pl-3 py-2 rounded-lg focus:outline-none focus:ring-1 focus:ring-gpt-accent">
                       </div>
                   </div>
 
                   <div id="history-list" class="flex-1 overflow-y-auto px-2 py-2 space-y-1"></div>
 
                   <div class="p-3 border-t border-gray-200 dark:border-white/10 space-y-1">
-                      <button onclick="openSettingsModal()" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors">
-                          <div class="w-7 h-7 rounded-full bg-gradient-to-tr from-emerald-500 to-teal-400 text-white flex items-center justify-center font-semibold text-xs">PG</div>
-                          <div class="flex-1 text-left truncate">
-                              <div class="font-medium text-xs leading-tight">Ensemble Settings</div>
-                              <div class="text-[11px] text-gray-400 truncate">5 models · weighted vote</div>
+                      <div class="flex items-center justify-between px-3 pb-1">
+                          <span class="text-[11px] uppercase tracking-wider text-gray-400 font-semibold">وضعیت سرور</span>
+                          <span id="status-dot" class="w-2 h-2 rounded-full bg-amber-400"></span>
+                      </div>
+                      <div id="status-text" class="px-3 pb-2 text-[11px] text-gray-400">در حال اتصال…</div>
+
+                      <button onclick="openSettingsModal()"
+                              class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors">
+                          <div class="w-7 h-7 rounded-full bg-gradient-to-tr from-emerald-500 to-teal-400 text-white flex items-center justify-center text-xs">
+                              <i class="fa-solid fa-shield-virus"></i>
+                          </div>
+                          <div class="flex-1 text-right truncate">
+                              <div class="font-medium text-xs">تنظیمات Ensemble</div>
+                              <div class="text-[11px] text-gray-400">۵ مدل · رأی‌گیری اجماعی</div>
                           </div>
                           <i class="fa-solid fa-sliders text-gray-400 text-xs"></i>
                       </button>
@@ -334,102 +413,112 @@ jobs:
               <!-- ============ MAIN ============ -->
               <main class="flex-1 flex flex-col h-full min-w-0 bg-white dark:bg-gpt-main relative">
 
-                  <!-- Top Bar -->
                   <header class="h-14 px-4 flex items-center justify-between border-b border-gray-100 dark:border-white/5 shrink-0 z-10">
                       <div class="flex items-center gap-2">
-                          <button id="open-sidebar-btn" onclick="toggleSidebar()" class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover md:hidden">
+                          <button id="open-sidebar-btn" onclick="toggleSidebar()"
+                                  class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover md:hidden">
                               <i class="fa-solid fa-table-columns"></i>
-                          </button>
-                          <button onclick="createNewAnalysis()" class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover md:hidden">
-                              <i class="fa-regular fa-pen-to-square"></i>
                           </button>
                           <div class="flex items-center gap-2 px-3 py-1.5 font-semibold text-base text-gray-800 dark:text-gray-100">
                               <i class="fa-solid fa-shield-halved text-gpt-accent"></i>
                               <span>PolyGuard</span>
-                              <span class="text-xs font-normal px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500 border border-emerald-500/20">5 Models</span>
+                              <span class="text-xs font-normal px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500 border border-emerald-500/20">
+                                  ۵ مدل
+                              </span>
                           </div>
                       </div>
+
                       <div class="flex items-center gap-1.5">
-                          <button onclick="exportCurrentAnalysis()" class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover transition-colors" title="Export as JSON">
+                          <button onclick="exportCurrent()"
+                                  class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover"
+                                  title="خروجی JSON">
                               <i class="fa-solid fa-download text-sm"></i>
                           </button>
-                          <button onclick="toggleTheme()" class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover transition-colors" title="Toggle theme">
+                          <button onclick="toggleTheme()"
+                                  class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover"
+                                  title="تغییر پوسته">
                               <i id="theme-icon" class="fa-solid fa-sun text-sm"></i>
                           </button>
                       </div>
                   </header>
 
-                  <!-- Messages / Results -->
                   <div id="messages-container" class="flex-1 overflow-y-auto px-4 py-6 scroll-smooth">
                       <div class="max-w-3xl mx-auto h-full flex flex-col">
 
                           <!-- Welcome -->
                           <div id="welcome-screen" class="my-auto py-8 flex flex-col items-center text-center">
-                              <div class="w-14 h-14 rounded-2xl bg-gpt-accent/10 border border-gpt-accent/30 text-gpt-accent flex items-center justify-center text-2xl mb-5">
+                              <div class="w-16 h-16 rounded-2xl bg-gpt-accent/10 border border-gpt-accent/30 text-gpt-accent flex items-center justify-center text-3xl mb-5">
                                   <i class="fa-solid fa-shield-halved"></i>
                               </div>
-                              <h1 class="text-2xl sm:text-3xl font-semibold text-gray-800 dark:text-gray-100 mb-2">
+                              <h1 class="text-2xl sm:text-3xl font-bold text-gray-800 dark:text-gray-100 mb-3">
                                   تشخیص محتوای سمی
                               </h1>
-                              <p class="text-sm text-gray-500 dark:text-gray-400 max-w-md mb-8">
-                                  ۵ مدل هوش مصنوعی با رأی‌گیری وزنی — آستانه سختگیرانه (TOXIC ≥ 0.05، SUSPECT ≥ 0.02)
+                              <p class="text-sm text-gray-500 dark:text-gray-400 max-w-lg mb-8 leading-relaxed">
+                                  ۵ مدل هوش مصنوعی با رأی‌گیری اجماعی — فقط وقتی حداقل ۲ مدل موافق باشند محتوا سمی علامت می‌خورد. مدل‌های انگلیسی روی متن فارسی نادیده گرفته می‌شوند.
                               </p>
 
-                              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl text-right" dir="rtl">
-                                  <button onclick="useStarter('کصکش')" class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
+                              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl text-right">
+                                  <button onclick="useStarter('سلام عزیزم، حالت چطوره؟')"
+                                          class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
                                       <div class="flex items-center justify-between w-full">
-                                          <span class="text-xs font-semibold uppercase tracking-wider text-red-500">Test: Toxic FA</span>
-                                          <i class="fa-solid fa-flask text-gray-400 group-hover:text-red-500"></i>
-                                      </div>
-                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200">فحش فارسی رکیک</p>
-                                  </button>
-
-                                  <button onclick="useStarter('You are an idiot')" class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
-                                      <div class="flex items-center justify-between w-full">
-                                          <span class="text-xs font-semibold uppercase tracking-wider text-amber-500">Test: Toxic EN</span>
-                                          <i class="fa-solid fa-flask text-gray-400 group-hover:text-amber-500"></i>
-                                      </div>
-                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200">Insult in English</p>
-                                  </button>
-
-                                  <button onclick="useStarter('سلام، حال شما چطور است؟')" class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
-                                      <div class="flex items-center justify-between w-full">
-                                          <span class="text-xs font-semibold uppercase tracking-wider text-emerald-500">Test: Safe FA</span>
+                                          <span class="text-xs font-semibold uppercase tracking-wider text-emerald-500">محترمانه فارسی</span>
                                           <i class="fa-solid fa-circle-check text-gray-400 group-hover:text-emerald-500"></i>
                                       </div>
-                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200">جمله محترمانه فارسی</p>
+                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200">سلام عزیزم، حالت چطوره؟</p>
                                   </button>
 
-                                  <button onclick="useStarter('Have a wonderful day!')" class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
+                                  <button onclick="useStarter('You are an idiot')"
+                                          class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
                                       <div class="flex items-center justify-between w-full">
-                                          <span class="text-xs font-semibold uppercase tracking-wider text-sky-500">Test: Safe EN</span>
+                                          <span class="text-xs font-semibold uppercase tracking-wider text-red-500">توهین انگلیسی</span>
+                                          <i class="fa-solid fa-triangle-exclamation text-gray-400 group-hover:text-red-500"></i>
+                                      </div>
+                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200" dir="ltr">You are an idiot</p>
+                                  </button>
+
+                                  <button onclick="useStarter('کصکش')"
+                                          class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
+                                      <div class="flex items-center justify-between w-full">
+                                          <span class="text-xs font-semibold uppercase tracking-wider text-red-500">فحش فارسی</span>
+                                          <i class="fa-solid fa-ban text-gray-400 group-hover:text-red-500"></i>
+                                      </div>
+                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200">کصکش</p>
+                                  </button>
+
+                                  <button onclick="useStarter('Have a wonderful day!')"
+                                          class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
+                                      <div class="flex items-center justify-between w-full">
+                                          <span class="text-xs font-semibold uppercase tracking-wider text-sky-500">محترمانه انگلیسی</span>
                                           <i class="fa-solid fa-circle-check text-gray-400 group-hover:text-sky-500"></i>
                                       </div>
-                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200">Polite English greeting</p>
+                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200" dir="ltr">Have a wonderful day!</p>
                                   </button>
                               </div>
                           </div>
 
-                          <!-- Analysis Stream -->
                           <div id="chat-stream" class="space-y-6 pb-6 hidden"></div>
                       </div>
                   </div>
 
-                  <!-- Composer -->
                   <div class="w-full px-4 pb-4 pt-2 bg-gradient-to-t from-white via-white dark:from-gpt-main dark:via-gpt-main to-transparent shrink-0">
                       <div class="max-w-3xl mx-auto">
                           <div class="relative flex flex-col bg-gray-100 dark:bg-gpt-input rounded-3xl border border-gray-200 dark:border-white/10 shadow-sm focus-within:ring-1 focus-within:ring-gray-300 dark:focus-within:ring-white/20 transition-all px-3 py-2.5">
-                              <textarea id="prompt-input" rows="1" placeholder="متن را برای بررسی وارد کنید..." oninput="autoResize(this)" onkeydown="handleKey(event)"
-                                  class="w-full max-h-48 bg-transparent text-gray-800 dark:text-gray-100 placeholder-gray-400 text-sm sm:text-base px-2 py-1 focus:outline-none resize-none overflow-y-auto leading-relaxed rtl"></textarea>
+
+                              <textarea id="prompt-input" rows="1"
+                                  placeholder="متن خود را برای بررسی وارد کنید... (Ctrl+Enter)"
+                                  oninput="autoResize(this)"
+                                  onkeydown="handleKey(event)"
+                                  class="w-full max-h-48 bg-transparent text-gray-800 dark:text-gray-100 placeholder-gray-400 text-sm sm:text-base px-2 py-1 focus:outline-none resize-none overflow-y-auto leading-relaxed"
+                                  dir="auto"></textarea>
+
                               <div class="flex items-center justify-between pt-2 px-1">
                                   <div class="flex items-center gap-1">
-                                      <span id="health-dot" class="w-2 h-2 rounded-full bg-gray-400" title="Server status"></span>
-                                      <span id="health-text" class="text-[11px] text-gray-400 mr-1">loading…</span>
+                                      <span class="text-[11px] text-gray-400">۵ مدل · رأی اجماعی</span>
                                   </div>
                                   <div class="flex items-center gap-2">
                                       <span id="char-counter" class="text-[11px] text-gray-400 hidden sm:inline"></span>
                                       <button id="send-btn" onclick="analyze()" disabled
-                                          class="w-8 h-8 rounded-full bg-black dark:bg-white text-white dark:text-black flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:opacity-90 transition-opacity">
+                                          class="w-9 h-9 rounded-full bg-black dark:bg-white text-white dark:text-black flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:opacity-90 transition-opacity shadow-sm">
                                           <i class="fa-solid fa-arrow-up text-sm"></i>
                                       </button>
                                   </div>
@@ -437,7 +526,7 @@ jobs:
                           </div>
                           <div class="text-center mt-2">
                               <p class="text-[11px] text-gray-400 dark:text-gray-500">
-                                  PolyGuard Ensemble · weighted voting · strict thresholds
+                                  PolyGuard Ensemble · رأی‌گیری اجماعی · تشخیص زبان خودکار
                               </p>
                           </div>
                       </div>
@@ -445,49 +534,52 @@ jobs:
               </main>
 
               <!-- ============ SETTINGS MODAL ============ -->
-              <div id="settings-modal" class="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 hidden flex items-center justify-center p-4">
+              <div id="settings-modal" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
                   <div class="bg-white dark:bg-gpt-input border border-gray-200 dark:border-white/10 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-5 animate-fadeIn">
                       <div class="flex items-center justify-between border-b border-gray-200 dark:border-white/10 pb-3">
                           <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-100 flex items-center gap-2">
                               <i class="fa-solid fa-sliders text-gpt-accent"></i>
-                              <span>Ensemble Settings</span>
+                              <span>تنظیمات Ensemble</span>
                           </h3>
                           <button onclick="closeSettingsModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
                               <i class="fa-solid fa-xmark text-lg"></i>
                           </button>
                       </div>
+
                       <div class="space-y-3 text-xs">
                           <div class="flex justify-between items-center p-3 bg-gray-100 dark:bg-gpt-main rounded-xl">
-                              <span class="text-gray-500 dark:text-gray-400">Toxic threshold</span>
-                              <span id="cfg-toxic" class="font-mono font-semibold">0.05</span>
+                              <span class="text-gray-500 dark:text-gray-400">آستانه رأی هر مدل</span>
+                              <span class="font-mono font-semibold">0.50</span>
                           </div>
                           <div class="flex justify-between items-center p-3 bg-gray-100 dark:bg-gpt-main rounded-xl">
-                              <span class="text-gray-500 dark:text-gray-400">Suspect threshold</span>
-                              <span id="cfg-suspect" class="font-mono font-semibold">0.02</span>
+                              <span class="text-gray-500 dark:text-gray-400">حداقل رأی برای سمی</span>
+                              <span class="font-mono font-semibold">2</span>
                           </div>
                           <div class="flex justify-between items-center p-3 bg-gray-100 dark:bg-gpt-main rounded-xl">
-                              <span class="text-gray-500 dark:text-gray-400">Voting mode</span>
-                              <span class="font-mono font-semibold">max_weighted</span>
+                              <span class="text-gray-500 dark:text-gray-400">اطمینان تک‌مدلی</span>
+                              <span class="font-mono font-semibold">0.90</span>
                           </div>
                           <div class="p-3 bg-gray-100 dark:bg-gpt-main rounded-xl">
-                              <div class="text-gray-500 dark:text-gray-400 mb-2">Loaded models</div>
+                              <div class="text-gray-500 dark:text-gray-400 mb-2">مدل‌های فعال</div>
                               <div id="cfg-models" class="space-y-1 text-[11px] font-mono"></div>
                           </div>
                       </div>
+
                       <div class="pt-2 border-t border-gray-200 dark:border-white/10 flex items-center justify-between">
                           <button onclick="clearHistory()" class="text-xs text-red-500 hover:text-red-400 font-medium flex items-center gap-1.5">
                               <i class="fa-regular fa-trash-can"></i>
-                              <span>Clear history</span>
+                              <span>پاک کردن تاریخچه</span>
                           </button>
-                          <button onclick="closeSettingsModal()" class="px-4 py-2 rounded-xl bg-gpt-accent text-white text-xs font-semibold hover:opacity-95 transition">Close</button>
+                          <button onclick="closeSettingsModal()" class="px-4 py-2 rounded-xl bg-gpt-accent text-white text-xs font-semibold hover:opacity-95">
+                              بستن
+                          </button>
                       </div>
                   </div>
               </div>
 
-              <!-- Toast -->
-              <div id="toast" class="fixed top-4 right-4 z-50 hidden bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-4 py-2.5 rounded-xl shadow-lg text-xs font-medium flex items-center gap-2">
+              <div id="toast" class="fixed top-4 left-4 z-50 hidden bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-4 py-2.5 rounded-xl shadow-lg text-xs font-medium items-center gap-2">
                   <i class="fa-solid fa-circle-check text-emerald-500"></i>
-                  <span id="toast-message">Copied</span>
+                  <span id="toast-message">انجام شد</span>
               </div>
 
               <script src="/static/script.js"></script>
@@ -495,9 +587,9 @@ jobs:
           </html>
           HTMLEOF
 
-          # ============================================================
+          # ==================================================================
           # FRONTEND SCRIPT
-          # ============================================================
+          # ==================================================================
           cat > app/static/script.js << 'JSEOF'
           /**************************************************************
            * STATE
@@ -509,8 +601,7 @@ jobs:
             isAnalyzing: false,
             health: null
           };
-
-          const STORAGE_KEY = 'polyguard_history_v1';
+          const STORAGE_KEY = 'polyguard_history_v2';
 
           /**************************************************************
            * INIT
@@ -519,10 +610,9 @@ jobs:
             loadHistory();
             renderHistoryList();
             renderActive();
-            setupScrollWatcher();
             checkHealth();
             setInterval(checkHealth, 15000);
-            if (window.innerWidth > 768) document.getElementById('prompt-input').focus();
+            document.getElementById('prompt-input').focus();
           };
 
           /**************************************************************
@@ -547,38 +637,33 @@ jobs:
           }
 
           /**************************************************************
-           * HEALTH CHECK
+           * HEALTH
            **************************************************************/
           async function checkHealth() {
-            const dot = document.getElementById('health-dot');
-            const txt = document.getElementById('health-text');
+            const dot = document.getElementById('status-dot');
+            const txt = document.getElementById('status-text');
             try {
               const r = await fetch('/health');
               const d = await r.json();
               state.health = d;
               if (d.status === 'ok') {
                 dot.className = 'w-2 h-2 rounded-full bg-emerald-500';
-                txt.textContent = `${d.loaded_models.length}/5 models ready`;
+                txt.textContent = `${d.loaded_models.length} از ۵ مدل آماده`;
               } else if (d.status === 'loading') {
-                dot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-pulse';
-                txt.textContent = `loading… (${(d.loaded||[]).length}/5)`;
+                dot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
+                txt.textContent = `در حال بارگذاری… (${(d.loaded||[]).length}/5)`;
               } else {
                 dot.className = 'w-2 h-2 rounded-full bg-red-500';
-                txt.textContent = 'error';
+                txt.textContent = 'خطا';
               }
-              // Update settings modal
-              const cfgT = document.getElementById('cfg-toxic');
-              const cfgS = document.getElementById('cfg-suspect');
               const cfgM = document.getElementById('cfg-models');
-              if (cfgT && d.toxic_threshold) cfgT.textContent = d.toxic_threshold;
-              if (cfgS && d.suspect_threshold) cfgS.textContent = d.suspect_threshold;
               if (cfgM && d.loaded_models) {
                 cfgM.innerHTML = d.loaded_models.map(m => `✅ ${m}`).join('<br>') +
                   (d.errors && Object.keys(d.errors).length ? '<br>❌ ' + Object.keys(d.errors).join(', ') : '');
               }
             } catch (e) {
               dot.className = 'w-2 h-2 rounded-full bg-red-500';
-              txt.textContent = 'offline';
+              txt.textContent = 'آفلاین';
             }
           }
 
@@ -590,31 +675,27 @@ jobs:
             const backdrop = document.getElementById('mobile-backdrop');
             const isMobile = window.innerWidth < 768;
             if (isMobile) {
-              const hidden = sidebar.classList.contains('-translate-x-full');
-              if (hidden) { sidebar.classList.remove('-translate-x-full'); backdrop.classList.remove('hidden'); }
-              else { sidebar.classList.add('-translate-x-full'); backdrop.classList.add('hidden'); }
+              const hidden = sidebar.classList.contains('translate-x-full');
+              if (hidden) { sidebar.classList.remove('translate-x-full'); backdrop.classList.remove('hidden'); }
+              else { sidebar.classList.add('translate-x-full'); backdrop.classList.add('hidden'); }
             } else {
               state.sidebarOpen = !state.sidebarOpen;
-              if (state.sidebarOpen) sidebar.classList.remove('md:-ml-[260px]');
-              else sidebar.classList.add('md:-ml-[260px]');
+              if (state.sidebarOpen) sidebar.classList.remove('md:-mr-[260px]');
+              else sidebar.classList.add('md:-mr-[260px]');
             }
           }
 
           function createNewAnalysis() {
             if (state.isAnalyzing) return;
             state.activeId = null;
-            saveHistory();
-            renderHistoryList();
-            renderActive();
+            saveHistory(); renderHistoryList(); renderActive();
             document.getElementById('prompt-input').focus();
           }
 
           function selectAnalysis(id) {
             if (state.isAnalyzing) return;
             state.activeId = id;
-            saveHistory();
-            renderHistoryList();
-            renderActive();
+            saveHistory(); renderHistoryList(); renderActive();
             if (window.innerWidth < 768) toggleSidebar();
           }
 
@@ -622,37 +703,32 @@ jobs:
             event.stopPropagation();
             state.history = state.history.filter(h => h.id !== id);
             if (state.activeId === id) state.activeId = null;
-            saveHistory();
-            renderHistoryList();
-            renderActive();
-            showToast('Deleted');
+            saveHistory(); renderHistoryList(); renderActive();
+            showToast('حذف شد');
           }
 
           function clearHistory() {
-            if (!confirm('Clear all history?')) return;
-            state.history = [];
-            state.activeId = null;
-            saveHistory();
-            renderHistoryList();
-            renderActive();
+            if (!confirm('همه تاریخچه پاک شود؟')) return;
+            state.history = []; state.activeId = null;
+            saveHistory(); renderHistoryList(); renderActive();
             closeSettingsModal();
-            showToast('History cleared');
+            showToast('تاریخچه پاک شد');
           }
 
           function renderHistoryList() {
             const el = document.getElementById('history-list');
-            const q = (document.getElementById('search-chats').value || '').toLowerCase().trim();
+            const q = (document.getElementById('search-scans').value || '').toLowerCase().trim();
             const filtered = state.history
               .filter(h => (h.text || '').toLowerCase().includes(q))
               .sort((a, b) => b.ts - a.ts);
 
             if (!filtered.length) {
               el.innerHTML = `<div class="text-center py-8 px-3 text-xs text-gray-400">
-                ${q ? 'No matching analyses' : 'No history yet'}</div>`;
+                ${q ? 'موردی یافت نشد' : 'هنوز تاریخچه‌ای نیست'}</div>`;
               return;
             }
 
-            let html = `<div class="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-gray-400">Recent analyses</div>`;
+            let html = `<div class="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-gray-400">تحلیل‌های اخیر</div>`;
             filtered.forEach(h => {
               const isActive = h.id === state.activeId;
               const icon = h.result?.decision === 'TOXIC' ? '🚫'
@@ -660,9 +736,9 @@ jobs:
               const preview = (h.text || '').slice(0, 32) + ((h.text || '').length > 32 ? '…' : '');
               html += `
                 <div onclick="selectAnalysis('${h.id}')" class="group flex items-center justify-between px-3 py-2.5 rounded-xl cursor-pointer text-sm transition-colors ${isActive ? 'bg-gray-200 dark:bg-gpt-hover text-gray-900 dark:text-white font-medium' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-200/60 dark:hover:bg-gpt-hover/60'}">
-                  <div class="flex items-center gap-2.5 truncate pr-2">
+                  <div class="flex items-center gap-2.5 truncate pl-2">
                     <span class="text-xs">${icon}</span>
-                    <span class="truncate text-xs sm:text-sm">${escapeHtml(preview || 'analysis')}</span>
+                    <span class="truncate text-xs sm:text-sm">${escapeHtml(preview || 'تحلیل')}</span>
                   </div>
                   <button onclick="deleteAnalysis(event, '${h.id}')" class="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-red-400">
                     <i class="fa-regular fa-trash-can text-xs"></i>
@@ -688,13 +764,12 @@ jobs:
             welcome.classList.add('hidden');
             stream.classList.remove('hidden');
             stream.innerHTML = buildAnalysisHTML(active);
-            scrollToBottom(false);
           }
 
           function buildAnalysisHTML(item) {
             const userBubble = `
               <div class="flex flex-col items-end w-full animate-fadeIn">
-                <div class="max-w-[85%] sm:max-w-[75%] bg-gray-100 dark:bg-gpt-userBubble text-gray-800 dark:text-gray-100 px-4 py-3 rounded-3xl rounded-br-lg text-sm sm:text-base leading-relaxed whitespace-pre-wrap break-words rtl">${escapeHtml(item.text)}</div>
+                <div class="max-w-[85%] sm:max-w-[75%] bg-gray-100 dark:bg-gpt-userBubble text-gray-800 dark:text-gray-100 px-4 py-3 rounded-3xl rounded-br-lg text-sm sm:text-base leading-relaxed whitespace-pre-wrap break-words" dir="auto">${escapeHtml(item.text)}</div>
               </div>`;
 
             const r = item.result;
@@ -702,57 +777,61 @@ jobs:
               return userBubble + `
                 <div class="flex animate-fadeIn">
                   <div class="max-w-full bg-red-500/10 border border-red-500/30 text-red-500 px-4 py-3 rounded-2xl text-sm">
-                    ⚠ ${escapeHtml(r?.error || 'no result')}
+                    ⚠ ${escapeHtml(r?.error || 'خطا')}
                   </div>
                 </div>`;
             }
 
             const colorMap = {
-              TOXIC:   { bg: 'bg-red-500/10',    border: 'border-red-500/30',    text: 'text-red-500',    icon: '🚫', label: 'محتوای سمی' },
-              SUSPECT: { bg: 'bg-amber-500/10',  border: 'border-amber-500/30',  text: 'text-amber-500',  icon: '⚠️', label: 'مشکوک — نیاز به بازبینی' },
-              SAFE:    { bg: 'bg-emerald-500/10',border: 'border-emerald-500/30',text: 'text-emerald-500',icon: '✅', label: 'محتوای سالم' }
+              TOXIC:   { bg: 'bg-red-500/10',     border: 'border-red-500/30',     text: 'text-red-500',     icon: '🚫', label: 'محتوای سمی' },
+              SUSPECT: { bg: 'bg-amber-500/10',   border: 'border-amber-500/30',   text: 'text-amber-500',   icon: '⚠️', label: 'مشکوک — نیاز به بازبینی' },
+              SAFE:    { bg: 'bg-emerald-500/10', border: 'border-emerald-500/30', text: 'text-emerald-500', icon: '✅', label: 'محتوای سالم' }
             };
             const c = colorMap[r.decision];
 
-            // Decision banner
+            const scriptLabel = r.script === 'fa' ? 'فارسی'
+                             : r.script === 'en' ? 'انگلیسی'
+                             : 'مختلط';
+
             const banner = `
-              <div class="${c.bg} ${c.border} border rounded-2xl px-5 py-4 animate-fadeIn">
+              <div class="${c.bg} ${c.border} border rounded-2xl px-5 py-4 animate-fadeIn ${r.decision==='TOXIC' ? 'pulse-ring' : ''}">
                 <div class="flex items-center justify-between flex-wrap gap-3">
                   <div class="flex items-center gap-3">
                     <span class="text-3xl">${c.icon}</span>
                     <div>
                       <div class="${c.text} font-bold text-lg">${c.label}</div>
-                      <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                        حداکثر امتیاز وزنی: <span class="font-mono font-semibold">${(r.max_weighted*100).toFixed(1)}%</span>
-                        · آستانه سمی: <span class="font-mono">${r.toxic_threshold}</span>
-                        · ${r.total_models} مدل
+                      <div class="text-xs text-gray-500 dark:text-gray-400 mt-1 leading-relaxed">
+                        رأی‌ها: <span class="font-mono font-semibold">${r.votes_count}/${r.total_models}</span>
+                        · حداکثر امتیاز: <span class="font-mono font-semibold">${(r.max_raw*100).toFixed(1)}%</span>
+                        · زبان: <span class="font-semibold">${scriptLabel}</span>
+                        ${r.skipped_models?.length ? `· رد شده: <span class="font-mono">${r.skipped_models.length}</span>` : ''}
                       </div>
                     </div>
                   </div>
-                  <div class="text-right">
-                    <div class="text-[10px] uppercase tracking-wider text-gray-400">Max weighted</div>
-                    <div class="font-mono font-bold ${c.text} text-xl">${(r.max_weighted*100).toFixed(1)}%</div>
+                  <div class="text-left">
+                    <div class="text-[10px] uppercase tracking-wider text-gray-400">اعتماد</div>
+                    <div class="font-mono font-bold ${c.text} text-xl">${(r.confidence*100).toFixed(1)}%</div>
                   </div>
                 </div>
               </div>`;
 
-            // Per-model breakdown
             const rows = Object.keys(r.raw_scores).map(name => {
               const raw = r.raw_scores[name];
               const w   = r.weighted_scores[name];
               const lbl = r.labels?.[name] || name;
-              const flagged = w >= r.toxic_threshold;
-              const suspect = !flagged && w >= r.suspect_threshold;
-              const cls   = flagged ? 'text-red-500' : suspect ? 'text-amber-500' : 'text-emerald-500';
-              const bgbar = flagged ? 'bg-red-500' : suspect ? 'bg-amber-500' : 'bg-emerald-500';
-              const pct   = Math.min(100, w * 100);
+              const voted = r.votes[name];
+              const cls   = voted ? 'text-red-500' : (raw >= 0.6 ? 'text-amber-500' : 'text-emerald-500');
+              const bgbar = voted ? 'bg-red-500' : (raw >= 0.6 ? 'bg-amber-500' : 'bg-emerald-500');
               const rawPct = Math.min(100, raw * 100);
               return `
                 <div class="py-3 border-b border-gray-200 dark:border-white/5 last:border-0">
-                  <div class="flex items-center justify-between mb-2">
-                    <div class="text-xs font-semibold text-gray-700 dark:text-gray-200">${escapeHtml(lbl)}</div>
+                  <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+                    <div class="flex items-center gap-2">
+                      <span class="text-sm">${voted ? '🚩' : '✅'}</span>
+                      <span class="text-xs font-semibold text-gray-700 dark:text-gray-200">${escapeHtml(lbl)}</span>
+                    </div>
                     <div class="flex items-center gap-3 text-[11px] font-mono">
-                      <span class="text-gray-400">raw ${(raw*100).toFixed(1)}%</span>
+                      <span class="text-gray-400">خام ${(raw*100).toFixed(1)}%</span>
                       <span class="${cls} font-bold">${(w*100).toFixed(1)}%</span>
                     </div>
                   </div>
@@ -762,20 +841,27 @@ jobs:
                 </div>`;
             }).join('');
 
+            const skippedHtml = (r.skipped_models && r.skipped_models.length) ? `
+              <div class="mt-3 pt-3 border-t border-gray-200 dark:border-white/5 text-[11px] text-gray-400">
+                <i class="fa-solid fa-circle-info mr-1"></i>
+                مدل‌های رد شده (ناسازگار با زبان): ${r.skipped_models.join(', ')}
+              </div>` : '';
+
             const breakdown = `
               <div class="bg-gray-50 dark:bg-gpt-input/40 border border-gray-200 dark:border-white/10 rounded-2xl p-4 animate-fadeIn">
                 <div class="flex items-center justify-between mb-3">
-                  <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Model breakdown</h3>
+                  <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">جزئیات رأی مدل‌ها</h3>
                   <button onclick="copyJSON('${item.id}')" class="text-[11px] text-gray-400 hover:text-gpt-accent flex items-center gap-1">
-                    <i class="fa-regular fa-copy"></i> copy JSON
+                    <i class="fa-regular fa-copy"></i> کپی JSON
                   </button>
                 </div>
                 ${rows}
+                ${skippedHtml}
               </div>`;
 
             const meta = `
               <div class="text-[10px] text-gray-400 dark:text-gray-500 text-center">
-                ${new Date(item.ts).toLocaleString()}
+                ${new Date(item.ts).toLocaleString('fa-IR')}
               </div>`;
 
             return `
@@ -792,7 +878,7 @@ jobs:
             if (!text || state.isAnalyzing) return;
 
             state.isAnalyzing = true;
-            setSendDisabled(true);
+            document.getElementById('send-btn').disabled = true;
             showLoadingBubble(text);
 
             try {
@@ -802,26 +888,16 @@ jobs:
                 body: JSON.stringify({ text })
               });
               const result = await r.json();
-
-              const item = {
-                id: 'an_' + Date.now(),
-                text,
-                result,
-                ts: Date.now()
-              };
+              const item = { id: 'an_' + Date.now(), text, result, ts: Date.now() };
               state.history.unshift(item);
               state.activeId = item.id;
-              saveHistory();
-              renderHistoryList();
-              renderActive();
-              input.value = '';
-              autoResize(input);
-              updateCharCounter();
+              saveHistory(); renderHistoryList(); renderActive();
+              input.value = ''; autoResize(input);
             } catch (e) {
-              showToast('Server error');
+              showToast('خطای سرور');
             } finally {
               state.isAnalyzing = false;
-              setSendDisabled(false);
+              document.getElementById('send-btn').disabled = false;
               document.getElementById('prompt-input').focus();
             }
           }
@@ -833,15 +909,16 @@ jobs:
             stream.classList.remove('hidden');
             stream.innerHTML = `
               <div class="flex flex-col items-end w-full">
-                <div class="max-w-[85%] bg-gray-100 dark:bg-gpt-userBubble text-gray-800 dark:text-gray-100 px-4 py-3 rounded-3xl rounded-br-lg text-sm whitespace-pre-wrap rtl">${escapeHtml(text)}</div>
+                <div class="max-w-[85%] bg-gray-100 dark:bg-gpt-userBubble text-gray-800 dark:text-gray-100 px-4 py-3 rounded-3xl rounded-br-lg text-sm whitespace-pre-wrap" dir="auto">${escapeHtml(text)}</div>
               </div>
               <div class="flex items-center gap-2 text-gray-400 text-sm animate-fadeIn">
                 <div class="w-2 h-2 rounded-full bg-gpt-accent typing-dot"></div>
                 <div class="w-2 h-2 rounded-full bg-gpt-accent typing-dot"></div>
                 <div class="w-2 h-2 rounded-full bg-gpt-accent typing-dot"></div>
-                <span class="text-xs mr-2">5 models analyzing…</span>
+                <span class="text-xs mr-2">۵ مدل در حال بررسی…</span>
               </div>`;
-            scrollToBottom(true);
+            const el = document.getElementById('messages-container');
+            el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
           }
 
           /**************************************************************
@@ -850,21 +927,17 @@ jobs:
           function autoResize(el) {
             el.style.height = 'auto';
             el.style.height = Math.min(el.scrollHeight, 192) + 'px';
-            updateCharCounter();
-            const btn = document.getElementById('send-btn');
-            btn.disabled = !el.value.trim() || state.isAnalyzing;
-          }
-          function updateCharCounter() {
-            const v = document.getElementById('prompt-input').value;
+            const v = el.value;
             const c = document.getElementById('char-counter');
-            if (v.length > 0) { c.textContent = v.length + ' chars'; c.classList.remove('hidden'); }
+            if (v.length > 0) { c.textContent = v.length + ' کاراکتر'; c.classList.remove('hidden'); }
             else c.classList.add('hidden');
+            document.getElementById('send-btn').disabled = !v.trim() || state.isAnalyzing;
           }
           function handleKey(e) {
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); analyze(); }
-          }
-          function setSendDisabled(v) {
-            document.getElementById('send-btn').disabled = v;
+            if (e.key === 'Enter' && (e.ctrlKey || !e.shiftKey)) {
+              e.preventDefault();
+              analyze();
+            }
           }
           function useStarter(text) {
             const input = document.getElementById('prompt-input');
@@ -881,34 +954,22 @@ jobs:
               '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
             }[ch]));
           }
-          function scrollToBottom(smooth) {
-            const el = document.getElementById('messages-container');
-            el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
-          }
-          function setupScrollWatcher() {
-            const el = document.getElementById('messages-container');
-            const btn = document.getElementById('scroll-bottom-btn');
-            if (!btn) return;
-            el.addEventListener('scroll', () => {
-              const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-              btn.classList.toggle('hidden', nearBottom);
-            });
-          }
           function showToast(msg) {
             const t = document.getElementById('toast');
             document.getElementById('toast-message').textContent = msg;
             t.classList.remove('hidden');
-            setTimeout(() => t.classList.add('hidden'), 2200);
+            t.classList.add('flex');
+            setTimeout(() => { t.classList.add('hidden'); t.classList.remove('flex'); }, 2200);
           }
           function copyJSON(id) {
             const item = state.history.find(h => h.id === id);
             if (!item) return;
             navigator.clipboard.writeText(JSON.stringify(item.result, null, 2));
-            showToast('Result JSON copied');
+            showToast('JSON کپی شد');
           }
-          function exportCurrentAnalysis() {
+          function exportCurrent() {
             const item = state.history.find(h => h.id === state.activeId);
-            if (!item) { showToast('Nothing to export'); return; }
+            if (!item) { showToast('چیزی برای خروجی نیست'); return; }
             const blob = new Blob([JSON.stringify(item, null, 2)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -916,7 +977,7 @@ jobs:
             a.download = `polyguard_${item.id}.json`;
             a.click();
             URL.revokeObjectURL(url);
-            showToast('Exported');
+            showToast('خروجی گرفته شد');
           }
           function toggleTheme() {
             const root = document.documentElement;
@@ -924,8 +985,14 @@ jobs:
             const icon = document.getElementById('theme-icon');
             icon.className = root.classList.contains('dark') ? 'fa-solid fa-sun text-sm' : 'fa-solid fa-moon text-sm';
           }
-          function openSettingsModal() { document.getElementById('settings-modal').classList.remove('hidden'); }
-          function closeSettingsModal() { document.getElementById('settings-modal').classList.add('hidden'); }
+          function openSettingsModal() {
+            document.getElementById('settings-modal').classList.remove('hidden');
+            document.getElementById('settings-modal').classList.add('flex');
+          }
+          function closeSettingsModal() {
+            document.getElementById('settings-modal').classList.add('hidden');
+            document.getElementById('settings-modal').classList.remove('flex');
+          }
           JSEOF
 
           echo "✔ All app files created"
@@ -983,7 +1050,7 @@ jobs:
             exit 1
           fi
           echo "PUBLIC_URL=$URL" >> $GITHUB_ENV
-          echo "### 🌐 PolyGuard Ensemble (NexusAI UI) is live at: $URL" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 PolyGuard Ensemble is live at: $URL" >> $GITHUB_STEP_SUMMARY
           echo "🔗 $URL"
 
       - name: Keep service alive
@@ -995,8 +1062,6 @@ jobs:
             pgrep -f "uvicorn app.main:app" >/dev/null || {
               echo "⚠ Uvicorn died, restarting..."
               MODELS_ROOT="$MODELS_ROOT" \
-              TOXIC_THRESHOLD="$TOXIC_THRESHOLD" \
-              SUSPECT_THRESHOLD="$SUSPECT_THRESHOLD" \
                 nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 >> server.log 2>&1 &
             }
             pgrep -f "cloudflared tunnel" >/dev/null || {
