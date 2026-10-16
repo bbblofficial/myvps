@@ -72,7 +72,7 @@ jobs:
           echo "--- model sizes ---"
           du -sh "$MODELS_ROOT"/*
 
-      - name: Create PolyGuard app files
+      - name: Create PolyGuard app files (Full ChatGPT UI)
         run: |
           mkdir -p app/static
 
@@ -88,6 +88,7 @@ jobs:
           os.environ.setdefault("MKL_NUM_THREADS", "4")
 
           import re
+          import time
           import threading
           from contextlib import asynccontextmanager
           from pathlib import Path
@@ -174,15 +175,14 @@ jobs:
               return "mixed"
 
           def ensemble_predict(text: str) -> Dict:
+              t0 = time.perf_counter()
               script = _detect_script(text)
 
               raw, weighted, labels, labels_en, skipped = {}, {}, {}, {}, []
               for name, (mdl, tok, mode, weight, lang, label, label_en) in state["models"].items():
-                  # Skip English-only models on Persian text
                   if script == "fa" and lang == "en":
                       skipped.append(name)
                       continue
-                  # Skip Persian-only model on pure English text
                   if script == "en" and lang == "fa":
                       skipped.append(name)
                       continue
@@ -220,24 +220,26 @@ jobs:
 
               top2 = sorted(raw.values(), reverse=True)[:2]
               confidence = round(sum(top2) / len(top2), 4)
+              latency_ms = round((time.perf_counter() - t0) * 1000)
 
               return {
-                  "decision":         decision,
-                  "max_weighted":     round(max_weighted, 4),
-                  "max_raw":          round(max_raw, 4),
-                  "confidence":       confidence,
-                  "votes_count":      votes_count,
-                  "votes":            votes,
-                  "raw_scores":       raw,
-                  "weighted_scores":  weighted,
-                  "labels":           labels,
-                  "labels_en":        labels_en,
-                  "total_models":     len(raw),
-                  "skipped_models":   skipped,
-                  "script":           script,
-                  "vote_threshold":   PER_MODEL_VOTE_THRESHOLD,
-                  "min_votes":        MIN_VOTES_FOR_TOXIC,
-                  "errors":           state["errors"],
+                  "decision":        decision,
+                  "max_weighted":    round(max_weighted, 4),
+                  "max_raw":         round(max_raw, 4),
+                  "confidence":      confidence,
+                  "votes_count":     votes_count,
+                  "votes":           votes,
+                  "raw_scores":      raw,
+                  "weighted_scores": weighted,
+                  "labels":          labels,
+                  "labels_en":       labels_en,
+                  "total_models":    len(raw),
+                  "skipped_models":  skipped,
+                  "script":          script,
+                  "vote_threshold":  PER_MODEL_VOTE_THRESHOLD,
+                  "min_votes":       MIN_VOTES_FOR_TOXIC,
+                  "latency_ms":      latency_ms,
+                  "errors":          state["errors"],
               }
 
           @asynccontextmanager
@@ -273,7 +275,7 @@ jobs:
           PYEOF
 
           # ==================================================================
-          # FRONTEND — HTML (NexusAI-style + Vazirmatn Persian font)
+          # FRONTEND — Full ChatGPT (chatgpt.com) UI Clone + Vazirmatn Font
           # ==================================================================
           cat > app/static/index.html << 'HTMLEOF'
           <!DOCTYPE html>
@@ -281,7 +283,7 @@ jobs:
           <head>
               <meta charset="UTF-8">
               <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <title>PolyGuard Ensemble — تشخیص محتوای سمی</title>
+              <title>PolyGuard</title>
 
               <script src="https://cdn.tailwindcss.com"></script>
               <script>
@@ -290,19 +292,19 @@ jobs:
                       theme: {
                           extend: {
                               colors: {
-                                  gpt: {
-                                      sidebar: '#171717',
-                                      main:    '#212121',
-                                      input:   '#2f2f2f',
-                                      hover:   '#2a2b32',
-                                      border:  '#383838',
-                                      userBubble: '#2f2f2f',
-                                      accent:  '#10a37f'
+                                  token: {
+                                      sidebar: 'var(--bg-sidebar)',
+                                      main: 'var(--bg-main)',
+                                      surface: 'var(--bg-surface)',
+                                      hover: 'var(--bg-hover)',
+                                      border: 'var(--border-subtle)',
+                                      primary: 'var(--text-primary)',
+                                      secondary: 'var(--text-secondary)',
+                                      tertiary: 'var(--text-tertiary)'
                                   }
                               },
                               fontFamily: {
-                                  sans: ['Vazirmatn', 'Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Tahoma', 'sans-serif'],
-                                  fa:   ['Vazirmatn', 'Tahoma', 'sans-serif'],
+                                  sans: ['Vazirmatn', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
                                   mono: ['Fira Code', 'JetBrains Mono', 'Consolas', 'monospace']
                               }
                           }
@@ -310,275 +312,381 @@ jobs:
                   }
               </script>
 
-              <!-- Persian font: Vazirmatn (Google Fonts) -->
               <link rel="preconnect" href="https://fonts.googleapis.com">
               <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-              <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
-
+              <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
               <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 
               <style>
-                  * { font-family: 'Vazirmatn', 'Inter', Tahoma, sans-serif; }
+                  :root {
+                      --bg-main: #ffffff;
+                      --bg-sidebar: #f9f9f9;
+                      --bg-surface: #f4f4f4;
+                      --bg-hover: #ececec;
+                      --border-subtle: rgba(0, 0, 0, 0.08);
+                      --text-primary: #0d0d0d;
+                      --text-secondary: #5d5d5d;
+                      --text-tertiary: #8e8ea0;
+                  }
+                  html.dark {
+                      --bg-main: #212121;
+                      --bg-sidebar: #171717;
+                      --bg-surface: #2f2f2f;
+                      --bg-hover: #2a2a2a;
+                      --border-subtle: rgba(255, 255, 255, 0.08);
+                      --text-primary: #ececec;
+                      --text-secondary: #b4b4b4;
+                      --text-tertiary: #737373;
+                  }
+
+                  * { font-family: 'Vazirmatn', -apple-system, BlinkMacSystemFont, sans-serif; }
                   .font-mono, code, pre { font-family: 'Fira Code', monospace !important; }
 
                   ::-webkit-scrollbar { width: 6px; height: 6px; }
                   ::-webkit-scrollbar-track { background: transparent; }
-                  ::-webkit-scrollbar-thumb { background: rgba(156,163,175,.3); border-radius: 9999px; }
-                  ::-webkit-scrollbar-thumb:hover { background: rgba(156,163,175,.5); }
+                  ::-webkit-scrollbar-thumb { background: rgba(142, 142, 160, 0.25); border-radius: 9999px; }
+                  ::-webkit-scrollbar-thumb:hover { background: rgba(142, 142, 160, 0.45); }
 
-                  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-                  .animate-fadeIn { animation: fadeIn .28s ease both; }
-
-                  @keyframes pulseRing {
-                      0%   { box-shadow: 0 0 0 0 rgba(239,68,68,.5); }
-                      70%  { box-shadow: 0 0 0 14px rgba(239,68,68,0); }
-                      100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+                  @keyframes fadeIn {
+                      from { opacity: 0; transform: translateY(4px); }
+                      to { opacity: 1; transform: translateY(0); }
                   }
-                  .pulse-ring { animation: pulseRing 1.6s infinite; }
+                  .animate-fadeIn { animation: fadeIn 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
 
-                  .typing-dot { animation: typingBounce 1.4s infinite ease-in-out both; }
-                  .typing-dot:nth-child(1) { animation-delay: -0.32s; }
-                  .typing-dot:nth-child(2) { animation-delay: -0.16s; }
-                  @keyframes typingBounce {
-                      0%, 80%, 100% { transform: scale(0); opacity: 0.4; }
+                  .score-bar { transition: width 0.7s cubic-bezier(0.22, 1, 0.36, 1); }
+
+                  .typing-dot { animation: chatgptPulse 1.3s infinite ease-in-out both; }
+                  .typing-dot:nth-child(1) { animation-delay: -0.30s; }
+                  .typing-dot:nth-child(2) { animation-delay: -0.15s; }
+                  @keyframes chatgptPulse {
+                      0%, 80%, 100% { transform: scale(0.4); opacity: 0.35; }
                       40% { transform: scale(1); opacity: 1; }
                   }
-
-                  .score-bar { transition: width .8s cubic-bezier(.2,.7,.2,1); }
-
-                  /* Persian digits feel more natural */
-                  .fa-num { font-feature-settings: "ss01"; }
               </style>
           </head>
-          <body class="bg-white dark:bg-gpt-main text-gray-800 dark:text-gray-100 font-sans antialiased h-screen w-screen overflow-hidden flex select-none">
 
+          <body class="bg-token-main text-token-primary h-screen w-screen overflow-hidden flex antialiased selection:bg-emerald-500/20">
+
+              <!-- Mobile Backdrop -->
               <div id="mobile-backdrop" onclick="toggleSidebar()"
-                   class="fixed inset-0 bg-black/60 z-30 hidden md:hidden backdrop-blur-sm"></div>
+                   class="fixed inset-0 bg-black/50 z-30 hidden md:hidden transition-opacity"></div>
 
-              <!-- ============ SIDEBAR ============ -->
+              <!-- ================= LEFT/RIGHT COLLAPSIBLE SIDEBAR (ChatGPT #171717) ================= -->
               <aside id="sidebar"
-                     class="fixed md:static inset-y-0 right-0 z-40 w-[260px] bg-gray-50 dark:bg-gpt-sidebar border-l border-gray-200 dark:border-white/10 flex flex-col transition-all duration-300 ease-in-out shrink-0 transform translate-x-full md:translate-x-0">
+                     class="fixed md:static inset-y-0 right-0 z-40 w-[260px] bg-token-sidebar flex flex-col transition-all duration-200 ease-in-out shrink-0 transform translate-x-full md:translate-x-0 border-l border-token-border select-none">
 
-                  <div class="p-3 flex items-center justify-between gap-2">
+                  <!-- Sidebar Top Bar (Collapse + New Chat Icons) -->
+                  <div class="h-14 px-3 flex items-center justify-between">
                       <button onclick="toggleSidebar()"
-                              class="p-2.5 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors"
+                              class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
                               title="بستن نوار کناری">
-                          <i class="fa-solid fa-table-columns"></i>
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                              <line x1="15" y1="3" x2="15" y2="21"></line>
+                          </svg>
                       </button>
 
-                      <button onclick="createNewAnalysis()"
-                              class="flex-1 flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors">
-                          <span class="flex items-center gap-2.5">
-                              <span class="w-6 h-6 rounded-full bg-gpt-accent text-white flex items-center justify-center text-xs">
-                                  <i class="fa-solid fa-shield-halved"></i>
-                              </span>
-                              <span>تحلیل جدید</span>
-                          </span>
-                          <i class="fa-regular fa-pen-to-square text-gray-400"></i>
-                      </button>
+                      <div class="flex items-center gap-1">
+                          <button onclick="toggleSearchInput()"
+                                  class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
+                                  title="جستجو در گفتگوها">
+                              <i class="fa-solid fa-magnifying-glass text-sm"></i>
+                          </button>
+                          <button onclick="createNewThread()"
+                                  class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
+                                  title="گفتگوی جدید">
+                              <i class="fa-regular fa-pen-to-square text-sm"></i>
+                          </button>
+                      </div>
                   </div>
 
-                  <div class="px-3 pb-2">
+                  <!-- Search Drawer (Hidden by default) -->
+                  <div id="sidebar-search-box" class="px-3 pb-2 hidden">
                       <div class="relative">
-                          <i class="fa-solid fa-magnifying-glass absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-400"></i>
-                          <input id="search-scans" type="text" oninput="renderHistoryList()"
-                                 placeholder="جستجو در تاریخچه..."
-                                 class="w-full bg-gray-200/70 dark:bg-white/5 text-xs text-gray-800 dark:text-gray-200 placeholder-gray-400 pr-8 pl-3 py-2 rounded-lg focus:outline-none focus:ring-1 focus:ring-gpt-accent">
+                          <i class="fa-solid fa-magnifying-glass absolute right-3 top-1/2 -translate-y-1/2 text-xs text-token-tertiary"></i>
+                          <input id="search-threads" type="text" oninput="renderSidebarThreads()"
+                                 placeholder="جستجو در گفتگوها..."
+                                 class="w-full bg-token-surface text-xs text-token-primary placeholder-token-tertiary pr-8 pl-7 py-2 rounded-lg focus:outline-none border border-token-border">
                       </div>
                   </div>
 
-                  <div id="history-list" class="flex-1 overflow-y-auto px-2 py-2 space-y-1"></div>
-
-                  <div class="p-3 border-t border-gray-200 dark:border-white/10 space-y-1">
-                      <div class="flex items-center justify-between px-3 pb-1">
-                          <span class="text-[11px] uppercase tracking-wider text-gray-400 font-semibold">وضعیت سرور</span>
-                          <span id="status-dot" class="w-2 h-2 rounded-full bg-amber-400"></span>
-                      </div>
-                      <div id="status-text" class="px-3 pb-2 text-[11px] text-gray-400">در حال اتصال…</div>
-
-                      <button onclick="openSettingsModal()"
-                              class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gpt-hover transition-colors">
-                          <div class="w-7 h-7 rounded-full bg-gradient-to-tr from-emerald-500 to-teal-400 text-white flex items-center justify-center text-xs">
-                              <i class="fa-solid fa-shield-virus"></i>
+                  <!-- Pinned Brand / GPT Item -->
+                  <div class="px-2 pb-1">
+                      <button onclick="createNewThread()"
+                              class="w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-sm text-token-primary hover:bg-token-hover transition-colors group">
+                          <div class="flex items-center gap-2.5 truncate">
+                              <div class="w-6 h-6 rounded-full bg-token-primary text-token-main flex items-center justify-center text-xs shrink-0">
+                                  <i class="fa-solid fa-shield-halved"></i>
+                              </div>
+                              <span class="font-medium text-[13px] truncate">PolyGuard Ensemble</span>
                           </div>
-                          <div class="flex-1 text-right truncate">
-                              <div class="font-medium text-xs">تنظیمات Ensemble</div>
-                              <div class="text-[11px] text-gray-400">۵ مدل · رأی‌گیری اجماعی</div>
-                          </div>
-                          <i class="fa-solid fa-sliders text-gray-400 text-xs"></i>
+                          <i class="fa-regular fa-pen-to-square text-xs text-token-tertiary opacity-0 group-hover:opacity-100 transition-opacity"></i>
                       </button>
+
+                      <button onclick="openModelsModal()"
+                              class="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[13px] text-token-secondary hover:bg-token-hover transition-colors">
+                          <div class="w-6 h-6 rounded-full flex items-center justify-center text-xs text-token-secondary">
+                              <i class="fa-solid fa-cubes-stacked"></i>
+                          </div>
+                          <span class="truncate">کاوش مدل‌های ۵گانه</span>
+                      </button>
+                  </div>
+
+                  <!-- Chronological Chat Threads List -->
+                  <div id="threads-list" class="flex-1 overflow-y-auto px-2 py-2 space-y-4"></div>
+
+                  <!-- Sidebar Footer: Live Model Status + User Profile Pill -->
+                  <div class="p-2 border-t border-token-border space-y-1">
+                      <div onclick="openSettingsModal()"
+                           class="flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-token-hover cursor-pointer transition-colors">
+                          <div class="flex items-center gap-2.5 min-w-0">
+                              <div class="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 text-white flex items-center justify-center text-xs font-bold shrink-0">
+                                  PG
+                              </div>
+                              <div class="truncate">
+                                  <div class="text-[13px] font-medium text-token-primary leading-tight truncate">PolyGuard Core</div>
+                                  <div class="flex items-center gap-1.5 mt-0.5">
+                                      <span id="status-dot" class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                                      <span id="status-text" class="text-[11px] text-token-secondary truncate">در حال اتصال…</span>
+                                  </div>
+                              </div>
+                          </div>
+                          <i class="fa-solid fa-ellipsis text-token-tertiary text-xs"></i>
+                      </div>
                   </div>
               </aside>
 
-              <!-- ============ MAIN ============ -->
-              <main class="flex-1 flex flex-col h-full min-w-0 bg-white dark:bg-gpt-main relative">
+              <!-- ================= CENTRAL CHAT WORKSPACE (ChatGPT #212121) ================= -->
+              <main class="flex-1 flex flex-col h-full min-w-0 bg-token-main relative">
 
-                  <header class="h-14 px-4 flex items-center justify-between border-b border-gray-100 dark:border-white/5 shrink-0 z-10">
-                      <div class="flex items-center gap-2">
+                  <!-- Top Sticky Header -->
+                  <header class="h-14 px-3 sm:px-4 flex items-center justify-between shrink-0 z-20">
+                      <div class="flex items-center gap-1">
+                          <!-- Show when sidebar is collapsed on desktop or mobile -->
                           <button id="open-sidebar-btn" onclick="toggleSidebar()"
-                                  class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover md:hidden">
-                              <i class="fa-solid fa-table-columns"></i>
+                                  class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors md:hidden"
+                                  title="باز کردن نوار کناری">
+                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                                  <line x1="15" y1="3" x2="15" y2="21"></line>
+                              </svg>
                           </button>
-                          <div class="flex items-center gap-2 px-3 py-1.5 font-semibold text-base text-gray-800 dark:text-gray-100">
-                              <i class="fa-solid fa-shield-halved text-gpt-accent"></i>
-                              <span>PolyGuard</span>
-                              <span class="text-xs font-normal px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500 border border-emerald-500/20">
-                                  ۵ مدل
-                              </span>
+                          <button id="new-chat-top-btn" onclick="createNewThread()"
+                                  class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors md:hidden"
+                                  title="گفتگوی جدید">
+                              <i class="fa-regular fa-pen-to-square text-sm"></i>
+                          </button>
+
+                          <!-- ChatGPT Model Selector Dropdown Button -->
+                          <div class="relative">
+                              <button onclick="toggleModelDropdown(event)"
+                                      class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-base font-semibold text-token-primary hover:bg-token-hover transition-colors">
+                                  <span>PolyGuard</span>
+                                  <span class="text-token-secondary font-normal text-sm">5-Ensemble</span>
+                                  <i class="fa-solid fa-chevron-down text-[11px] text-token-tertiary mr-0.5"></i>
+                              </button>
+
+                              <!-- Dropdown Menu -->
+                              <div id="model-dropdown"
+                                   class="hidden absolute right-0 mt-1.5 w-72 bg-token-surface border border-token-border rounded-2xl shadow-2xl p-1.5 z-50 animate-fadeIn">
+                                  <div class="px-3 py-1.5 text-[11px] text-token-tertiary font-medium">معماری تشخیص</div>
+                                  <button onclick="setViewMode('detailed')"
+                                          class="w-full flex items-center justify-between px-3 py-2.5 rounded-xl hover:bg-token-hover text-right transition-colors">
+                                      <div class="flex items-center gap-2.5">
+                                          <i class="fa-solid fa-layer-group text-sm text-token-primary"></i>
+                                          <div>
+                                              <div class="text-xs font-semibold text-token-primary">PolyGuard 5-Ensemble</div>
+                                              <div class="text-[11px] text-token-secondary">رأی‌گیری اجماعی + جزئیات ۵ مدل</div>
+                                          </div>
+                                      </div>
+                                      <i id="check-detailed" class="fa-solid fa-check text-xs text-token-primary"></i>
+                                  </button>
+                                  <button onclick="setViewMode('compact')"
+                                          class="w-full flex items-center justify-between px-3 py-2.5 rounded-xl hover:bg-token-hover text-right transition-colors">
+                                      <div class="flex items-center gap-2.5">
+                                          <i class="fa-solid fa-bolt text-sm text-token-secondary"></i>
+                                          <div>
+                                              <div class="text-xs font-semibold text-token-primary">PolyGuard Compact</div>
+                                              <div class="text-[11px] text-token-secondary">نمایش خلاصه و سریع نتیجه</div>
+                                          </div>
+                                      </div>
+                                      <i id="check-compact" class="fa-solid fa-check text-xs text-token-primary hidden"></i>
+                                  </button>
+                              </div>
                           </div>
                       </div>
 
-                      <div class="flex items-center gap-1.5">
-                          <button onclick="exportCurrent()"
-                                  class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover"
-                                  title="خروجی JSON">
-                              <i class="fa-solid fa-download text-sm"></i>
+                      <!-- Top-Left Utility Buttons -->
+                      <div class="flex items-center gap-1">
+                          <button onclick="exportCurrentThread()"
+                                  class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
+                                  title="خروجی JSON گفتگو">
+                              <i class="fa-solid fa-arrow-up-from-bracket text-sm"></i>
                           </button>
                           <button onclick="toggleTheme()"
-                                  class="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gpt-hover"
-                                  title="تغییر پوسته">
-                              <i id="theme-icon" class="fa-solid fa-sun text-sm"></i>
+                                  class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
+                                  title="تغییر حالت روز/شب">
+                              <i id="theme-icon" class="fa-regular fa-sun text-sm"></i>
                           </button>
                       </div>
                   </header>
 
-                  <div id="messages-container" class="flex-1 overflow-y-auto px-4 py-6 scroll-smooth">
-                      <div class="max-w-3xl mx-auto h-full flex flex-col">
+                  <!-- Scrollable Messages Stream -->
+                  <div id="messages-container" class="flex-1 overflow-y-auto px-4 scroll-smooth">
+                      <div class="max-w-[48rem] mx-auto min-h-full flex flex-col">
 
-                          <!-- Welcome -->
-                          <div id="welcome-screen" class="my-auto py-8 flex flex-col items-center text-center">
-                              <div class="w-16 h-16 rounded-2xl bg-gpt-accent/10 border border-gpt-accent/30 text-gpt-accent flex items-center justify-center text-3xl mb-5">
+                          <!-- Empty State (ChatGPT Centered Greeting) -->
+                          <div id="welcome-screen" class="my-auto py-10 flex flex-col items-center justify-center text-center">
+                              <div class="w-12 h-12 rounded-full bg-token-primary text-token-main flex items-center justify-center text-xl mb-5 shadow-sm">
                                   <i class="fa-solid fa-shield-halved"></i>
                               </div>
-                              <h1 class="text-2xl sm:text-3xl font-bold text-gray-800 dark:text-gray-100 mb-3">
-                                  تشخیص محتوای سمی
+                              <h1 class="text-2xl sm:text-[28px] font-semibold text-token-primary mb-7 tracking-tight">
+                                  چه متنی را برایتان بررسی کنم؟
                               </h1>
-                              <p class="text-sm text-gray-500 dark:text-gray-400 max-w-lg mb-8 leading-relaxed">
-                                  ۵ مدل هوش مصنوعی با رأی‌گیری اجماعی — فقط وقتی حداقل ۲ مدل موافق باشند محتوا سمی علامت می‌خورد. مدل‌های انگلیسی روی متن فارسی نادیده گرفته می‌شوند.
-                              </p>
 
-                              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-2xl text-right">
-                                  <button onclick="useStarter('سلام عزیزم، حالت چطوره؟')"
-                                          class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
-                                      <div class="flex items-center justify-between w-full">
-                                          <span class="text-xs font-semibold uppercase tracking-wider text-emerald-500">محترمانه فارسی</span>
-                                          <i class="fa-solid fa-circle-check text-gray-400 group-hover:text-emerald-500"></i>
+                              <!-- Starter Pills Grid -->
+                              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full max-w-2xl text-right">
+                                  <button onclick="useStarter('سلام وقت بخیر، از همکاری با شما بسیار خوشحالم.')"
+                                          class="group px-4 py-3 rounded-2xl border border-token-border bg-transparent hover:bg-token-surface transition-colors flex flex-col gap-1">
+                                      <div class="flex items-center gap-2 text-xs font-medium text-token-primary">
+                                          <i class="fa-regular fa-face-smile text-emerald-500"></i>
+                                          <span>جمله محترمانه فارسی</span>
                                       </div>
-                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200">سلام عزیزم، حالت چطوره؟</p>
+                                      <span class="text-xs text-token-secondary truncate w-full">سلام وقت بخیر، از همکاری با شما بسیار خوشحالم.</span>
                                   </button>
 
-                                  <button onclick="useStarter('You are an idiot')"
-                                          class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
-                                      <div class="flex items-center justify-between w-full">
-                                          <span class="text-xs font-semibold uppercase tracking-wider text-red-500">توهین انگلیسی</span>
-                                          <i class="fa-solid fa-triangle-exclamation text-gray-400 group-hover:text-red-500"></i>
+                                  <button onclick="useStarter('Have a wonderful and productive day ahead!')"
+                                          class="group px-4 py-3 rounded-2xl border border-token-border bg-transparent hover:bg-token-surface transition-colors flex flex-col gap-1">
+                                      <div class="flex items-center gap-2 text-xs font-medium text-token-primary">
+                                          <i class="fa-solid fa-globe text-sky-500"></i>
+                                          <span>جمله محترمانه انگلیسی</span>
                                       </div>
-                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200" dir="ltr">You are an idiot</p>
+                                      <span class="text-xs text-token-secondary truncate w-full" dir="ltr">Have a wonderful and productive day ahead!</span>
                                   </button>
 
-                                  <button onclick="useStarter('کصکش')"
-                                          class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
-                                      <div class="flex items-center justify-between w-full">
-                                          <span class="text-xs font-semibold uppercase tracking-wider text-red-500">فحش فارسی</span>
-                                          <i class="fa-solid fa-ban text-gray-400 group-hover:text-red-500"></i>
+                                  <button onclick="useStarter('You are completely stupid and useless')"
+                                          class="group px-4 py-3 rounded-2xl border border-token-border bg-transparent hover:bg-token-surface transition-colors flex flex-col gap-1">
+                                      <div class="flex items-center gap-2 text-xs font-medium text-token-primary">
+                                          <i class="fa-solid fa-triangle-exclamation text-amber-500"></i>
+                                          <span>تست توهین انگلیسی</span>
                                       </div>
-                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200">کصکش</p>
+                                      <span class="text-xs text-token-secondary truncate w-full" dir="ltr">You are completely stupid and useless</span>
                                   </button>
 
-                                  <button onclick="useStarter('Have a wonderful day!')"
-                                          class="group p-4 rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50/50 dark:bg-gpt-input/40 hover:bg-gray-100 dark:hover:bg-gpt-input transition-all flex flex-col gap-2">
-                                      <div class="flex items-center justify-between w-full">
-                                          <span class="text-xs font-semibold uppercase tracking-wider text-sky-500">محترمانه انگلیسی</span>
-                                          <i class="fa-solid fa-circle-check text-gray-400 group-hover:text-sky-500"></i>
+                                  <button onclick="useStarter('خیلی آدم بیشعور و نفهمی هستی')"
+                                          class="group px-4 py-3 rounded-2xl border border-token-border bg-transparent hover:bg-token-surface transition-colors flex flex-col gap-1">
+                                      <div class="flex items-center gap-2 text-xs font-medium text-token-primary">
+                                          <i class="fa-solid fa-shield-virus text-rose-500"></i>
+                                          <span>تست توهین فارسی</span>
                                       </div>
-                                      <p class="text-sm font-medium text-gray-700 dark:text-gray-200" dir="ltr">Have a wonderful day!</p>
+                                      <span class="text-xs text-token-secondary truncate w-full">خیلی آدم بیشعور و نفهمی هستی</span>
                                   </button>
                               </div>
                           </div>
 
-                          <div id="chat-stream" class="space-y-6 pb-6 hidden"></div>
+                          <!-- Active Thread Conversation Stream -->
+                          <div id="chat-stream" class="space-y-6 py-6 hidden"></div>
                       </div>
                   </div>
 
-                  <div class="w-full px-4 pb-4 pt-2 bg-gradient-to-t from-white via-white dark:from-gpt-main dark:via-gpt-main to-transparent shrink-0">
-                      <div class="max-w-3xl mx-auto">
-                          <div class="relative flex flex-col bg-gray-100 dark:bg-gpt-input rounded-3xl border border-gray-200 dark:border-white/10 shadow-sm focus-within:ring-1 focus-within:ring-gray-300 dark:focus-within:ring-white/20 transition-all px-3 py-2.5">
+                  <!-- ================= BOTTOM FLOATING PROMPT COMPOSER (ChatGPT #2f2f2f) ================= -->
+                  <div class="w-full px-4 pb-3 pt-1 bg-token-main shrink-0">
+                      <div class="max-w-[48rem] mx-auto">
+                          <div class="relative flex flex-col bg-token-surface rounded-[26px] border border-token-border px-3.5 py-2.5 shadow-sm focus-within:border-gray-400/40 dark:focus-within:border-white/20 transition-colors">
 
                               <textarea id="prompt-input" rows="1"
-                                  placeholder="متن خود را برای بررسی وارد کنید... (Ctrl+Enter)"
-                                  oninput="autoResize(this)"
-                                  onkeydown="handleKey(event)"
-                                  class="w-full max-h-48 bg-transparent text-gray-800 dark:text-gray-100 placeholder-gray-400 text-sm sm:text-base px-2 py-1 focus:outline-none resize-none overflow-y-auto leading-relaxed"
-                                  dir="auto"></textarea>
+                                        placeholder="متن خود را برای تحلیل PolyGuard بنویسید..."
+                                        oninput="autoResize(this)"
+                                        onkeydown="handleKey(event)"
+                                        class="w-full max-h-44 bg-transparent text-token-primary placeholder-token-secondary text-[15px] px-1.5 py-1 focus:outline-none resize-none overflow-y-auto leading-relaxed"
+                                        dir="auto"></textarea>
 
-                              <div class="flex items-center justify-between pt-2 px-1">
-                                  <div class="flex items-center gap-1">
-                                      <span class="text-[11px] text-gray-400">۵ مدل · رأی اجماعی</span>
+                              <div class="flex items-center justify-between pt-2 px-0.5">
+                                  <!-- Left/Right Composer Pill Actions -->
+                                  <div class="flex items-center gap-1.5">
+                                      <button onclick="pasteClipboard()"
+                                              class="h-8 px-2.5 rounded-full border border-token-border text-xs text-token-secondary hover:bg-token-hover flex items-center gap-1.5 transition-colors"
+                                              title="جای‌گذاری از کلیپ‌بورد">
+                                          <i class="fa-regular fa-paste text-[11px]"></i>
+                                          <span class="hidden sm:inline">جای‌گذاری</span>
+                                      </button>
+                                      <button onclick="openModelsModal()"
+                                              class="h-8 px-2.5 rounded-full border border-token-border text-xs text-token-secondary hover:bg-token-hover flex items-center gap-1.5 transition-colors">
+                                          <i class="fa-solid fa-sliders text-[11px]"></i>
+                                          <span>۵ مدل فعال</span>
+                                      </button>
                                   </div>
-                                  <div class="flex items-center gap-2">
-                                      <span id="char-counter" class="text-[11px] text-gray-400 hidden sm:inline"></span>
+
+                                  <!-- Send Button (ChatGPT Monochrome Circle) -->
+                                  <div class="flex items-center gap-2.5">
+                                      <span id="char-counter" class="text-[11px] text-token-tertiary font-mono hidden"></span>
                                       <button id="send-btn" onclick="analyze()" disabled
-                                          class="w-9 h-9 rounded-full bg-black dark:bg-white text-white dark:text-black flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:opacity-90 transition-opacity shadow-sm">
-                                          <i class="fa-solid fa-arrow-up text-sm"></i>
+                                              class="w-8 h-8 rounded-full bg-token-primary text-token-main flex items-center justify-center disabled:opacity-20 disabled:cursor-not-allowed hover:opacity-85 transition-opacity">
+                                          <i class="fa-solid fa-arrow-up text-xs"></i>
                                       </button>
                                   </div>
                               </div>
                           </div>
+
                           <div class="text-center mt-2">
-                              <p class="text-[11px] text-gray-400 dark:text-gray-500">
-                                  PolyGuard Ensemble · رأی‌گیری اجماعی · تشخیص زبان خودکار
+                              <p class="text-[11px] text-token-tertiary">
+                                  PolyGuard Ensemble از ۵ مدل زبانی با رأی‌گیری اجماعی استفاده می‌کند. نتایج را در موارد حساس بازبینی کنید.
                               </p>
                           </div>
                       </div>
                   </div>
               </main>
 
-              <!-- ============ SETTINGS MODAL ============ -->
-              <div id="settings-modal" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
-                  <div class="bg-white dark:bg-gpt-input border border-gray-200 dark:border-white/10 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-5 animate-fadeIn">
-                      <div class="flex items-center justify-between border-b border-gray-200 dark:border-white/10 pb-3">
-                          <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-100 flex items-center gap-2">
-                              <i class="fa-solid fa-sliders text-gpt-accent"></i>
-                              <span>تنظیمات Ensemble</span>
+              <!-- ================= SETTINGS & ENSEMBLE MODAL ================= -->
+              <div id="settings-modal" onclick="if(event.target===this)closeSettingsModal()"
+                   class="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 hidden items-center justify-center p-4">
+                  <div class="bg-token-surface border border-token-border rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 animate-fadeIn">
+                      <div class="flex items-center justify-between border-b border-token-border pb-3">
+                          <h3 class="text-base font-semibold text-token-primary flex items-center gap-2">
+                              <i class="fa-solid fa-sliders text-token-secondary"></i>
+                              <span>تنظیمات و وضعیت Ensemble</span>
                           </h3>
-                          <button onclick="closeSettingsModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
-                              <i class="fa-solid fa-xmark text-lg"></i>
+                          <button onclick="closeSettingsModal()" class="w-8 h-8 rounded-lg hover:bg-token-hover text-token-secondary flex items-center justify-center">
+                              <i class="fa-solid fa-xmark"></i>
                           </button>
                       </div>
 
-                      <div class="space-y-3 text-xs">
-                          <div class="flex justify-between items-center p-3 bg-gray-100 dark:bg-gpt-main rounded-xl">
-                              <span class="text-gray-500 dark:text-gray-400">آستانه رأی هر مدل</span>
-                              <span class="font-mono font-semibold">0.50</span>
+                      <div class="space-y-2.5 text-xs">
+                          <div class="flex justify-between items-center p-3 bg-token-main rounded-xl border border-token-border">
+                              <span class="text-token-secondary">آستانه رأی هر مدل (Vote Threshold)</span>
+                              <span class="font-mono font-semibold text-token-primary">0.50</span>
                           </div>
-                          <div class="flex justify-between items-center p-3 bg-gray-100 dark:bg-gpt-main rounded-xl">
-                              <span class="text-gray-500 dark:text-gray-400">حداقل رأی برای سمی</span>
-                              <span class="font-mono font-semibold">2</span>
+                          <div class="flex justify-between items-center p-3 bg-token-main rounded-xl border border-token-border">
+                              <span class="text-token-secondary">حداقل رأی برای برچسب سمی (Min Votes)</span>
+                              <span class="font-mono font-semibold text-token-primary">2 از 5</span>
                           </div>
-                          <div class="flex justify-between items-center p-3 bg-gray-100 dark:bg-gpt-main rounded-xl">
-                              <span class="text-gray-500 dark:text-gray-400">اطمینان تک‌مدلی</span>
-                              <span class="font-mono font-semibold">0.90</span>
+                          <div class="flex justify-between items-center p-3 bg-token-main rounded-xl border border-token-border">
+                              <span class="text-token-secondary">حالت تک‌مدل قاطع (Strong Single)</span>
+                              <span class="font-mono font-semibold text-token-primary">0.90</span>
                           </div>
-                          <div class="p-3 bg-gray-100 dark:bg-gpt-main rounded-xl">
-                              <div class="text-gray-500 dark:text-gray-400 mb-2">مدل‌های فعال</div>
-                              <div id="cfg-models" class="space-y-1 text-[11px] font-mono"></div>
+                          <div class="p-3 bg-token-main rounded-xl border border-token-border">
+                              <div class="text-token-secondary mb-2 font-medium">وضعیت مدل‌های بارگذاری‌شده در حافظه:</div>
+                              <div id="cfg-models" class="space-y-1.5 text-[11px] font-mono text-token-primary">در حال بررسی...</div>
                           </div>
                       </div>
 
-                      <div class="pt-2 border-t border-gray-200 dark:border-white/10 flex items-center justify-between">
-                          <button onclick="clearHistory()" class="text-xs text-red-500 hover:text-red-400 font-medium flex items-center gap-1.5">
+                      <div class="pt-2 border-t border-token-border flex items-center justify-between">
+                          <button onclick="clearAllHistory()"
+                                  class="px-3 py-2 rounded-xl text-xs text-rose-500 hover:bg-rose-500/10 font-medium flex items-center gap-1.5 transition-colors">
                               <i class="fa-regular fa-trash-can"></i>
-                              <span>پاک کردن تاریخچه</span>
+                              <span>پاک کردن تمام گفتگوها</span>
                           </button>
-                          <button onclick="closeSettingsModal()" class="px-4 py-2 rounded-xl bg-gpt-accent text-white text-xs font-semibold hover:opacity-95">
+                          <button onclick="closeSettingsModal()"
+                                  class="px-4 py-2 rounded-xl bg-token-primary text-token-main text-xs font-semibold hover:opacity-90 transition-opacity">
                               بستن
                           </button>
                       </div>
                   </div>
               </div>
 
-              <div id="toast" class="fixed top-4 left-4 z-50 hidden bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-4 py-2.5 rounded-xl shadow-lg text-xs font-medium items-center gap-2">
-                  <i class="fa-solid fa-circle-check text-emerald-500"></i>
+              <!-- Toast Notification -->
+              <div id="toast" class="fixed top-4 left-1/2 -translate-x-1/2 z-50 hidden bg-token-primary text-token-main px-4 py-2 rounded-full shadow-lg text-xs font-medium items-center gap-2">
+                  <i class="fa-solid fa-check text-emerald-500"></i>
                   <span id="toast-message">انجام شد</span>
               </div>
 
@@ -588,56 +696,68 @@ jobs:
           HTMLEOF
 
           # ==================================================================
-          # FRONTEND SCRIPT
+          # FRONTEND LOGIC — Multi-Turn Threads + ChatGPT Interactions
           # ==================================================================
           cat > app/static/script.js << 'JSEOF'
-          /**************************************************************
-           * STATE
-           **************************************************************/
+          const STORAGE_KEY = 'polyguard_chatgpt_threads_v3';
+
           const state = {
-            history: [],
-            activeId: null,
+            threads: [],       // [{ id, title, createdAt, updatedAt, messages: [{ id, text, result, ts }] }]
+            activeThreadId: null,
             sidebarOpen: true,
             isAnalyzing: false,
+            viewMode: 'detailed',
             health: null
           };
-          const STORAGE_KEY = 'polyguard_history_v2';
 
-          /**************************************************************
-           * INIT
-           **************************************************************/
           window.onload = function () {
-            loadHistory();
-            renderHistoryList();
-            renderActive();
+            loadState();
+            renderSidebarThreads();
+            renderActiveThread();
             checkHealth();
-            setInterval(checkHealth, 15000);
+            setInterval(checkHealth, 12000);
             document.getElementById('prompt-input').focus();
+
+            document.addEventListener('click', (e) => {
+              const dd = document.getElementById('model-dropdown');
+              if (dd && !dd.classList.contains('hidden')) {
+                dd.classList.add('hidden');
+              }
+            });
           };
 
           /**************************************************************
-           * PERSISTENCE
+           * STORAGE & MIGRATION
            **************************************************************/
-          function loadHistory() {
+          function loadState() {
             try {
-              const saved = localStorage.getItem(STORAGE_KEY);
-              if (saved) {
-                const parsed = JSON.parse(saved);
-                state.history = parsed.history || [];
-                state.activeId = parsed.activeId || null;
+              const raw = localStorage.getItem(STORAGE_KEY);
+              if (raw) {
+                const parsed = JSON.parse(raw);
+                state.threads = parsed.threads || [];
+                state.activeThreadId = parsed.activeThreadId || null;
+                state.viewMode = parsed.viewMode || 'detailed';
               }
-            } catch (e) { console.warn(e); }
+            } catch (e) {
+              console.warn(e);
+            }
+            updateViewModeCheckmarks();
           }
-          function saveHistory() {
+
+          function saveState() {
             try {
               localStorage.setItem(STORAGE_KEY, JSON.stringify({
-                history: state.history, activeId: state.activeId
+                threads: state.threads,
+                activeThreadId: state.activeThreadId,
+                viewMode: state.viewMode
               }));
-            } catch (e) { console.warn(e); }
+            } catch (e) {
+              console.warn(e);
+            }
           }
 
           /**************************************************************
-           * HEALTH
+           * SERVER HEALTH
            **************************************************************/
           async function checkHealth() {
             const dot = document.getElementById('status-dot');
@@ -647,239 +767,395 @@ jobs:
               const d = await r.json();
               state.health = d;
               if (d.status === 'ok') {
-                dot.className = 'w-2 h-2 rounded-full bg-emerald-500';
-                txt.textContent = `${d.loaded_models.length} از ۵ مدل آماده`;
+                dot.className = 'w-1.5 h-1.5 rounded-full bg-emerald-500';
+                txt.textContent = `${d.loaded_models.length}/5 مدل آماده`;
               } else if (d.status === 'loading') {
-                dot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
-                txt.textContent = `در حال بارگذاری… (${(d.loaded||[]).length}/5)`;
+                dot.className = 'w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse';
+                txt.textContent = `بارگذاری مدل‌ها (${(d.loaded || []).length}/5)…`;
               } else {
-                dot.className = 'w-2 h-2 rounded-full bg-red-500';
-                txt.textContent = 'خطا';
+                dot.className = 'w-1.5 h-1.5 rounded-full bg-rose-500';
+                txt.textContent = 'خطا در بارگذاری';
               }
               const cfgM = document.getElementById('cfg-models');
               if (cfgM && d.loaded_models) {
-                cfgM.innerHTML = d.loaded_models.map(m => `✅ ${m}`).join('<br>') +
-                  (d.errors && Object.keys(d.errors).length ? '<br>❌ ' + Object.keys(d.errors).join(', ') : '');
+                cfgM.innerHTML = d.loaded_models.map(m => `<div class="flex items-center justify-between py-0.5"><span>${m}</span><span class="text-emerald-500">● Ready</span></div>`).join('') +
+                  (d.errors && Object.keys(d.errors).length
+                    ? `<div class="text-rose-500 pt-1">خطا: ${Object.keys(d.errors).join(', ')}</div>`
+                    : '');
               }
             } catch (e) {
-              dot.className = 'w-2 h-2 rounded-full bg-red-500';
-              txt.textContent = 'آفلاین';
+              dot.className = 'w-1.5 h-1.5 rounded-full bg-rose-500';
+              txt.textContent = 'سرور آفلاین';
             }
           }
 
           /**************************************************************
-           * SIDEBAR
+           * SIDEBAR & NAVIGATION
            **************************************************************/
           function toggleSidebar() {
             const sidebar = document.getElementById('sidebar');
             const backdrop = document.getElementById('mobile-backdrop');
+            const openBtn = document.getElementById('open-sidebar-btn');
+            const newChatTopBtn = document.getElementById('new-chat-top-btn');
             const isMobile = window.innerWidth < 768;
+
             if (isMobile) {
               const hidden = sidebar.classList.contains('translate-x-full');
-              if (hidden) { sidebar.classList.remove('translate-x-full'); backdrop.classList.remove('hidden'); }
-              else { sidebar.classList.add('translate-x-full'); backdrop.classList.add('hidden'); }
+              if (hidden) {
+                sidebar.classList.remove('translate-x-full');
+                backdrop.classList.remove('hidden');
+              } else {
+                sidebar.classList.add('translate-x-full');
+                backdrop.classList.add('hidden');
+              }
             } else {
               state.sidebarOpen = !state.sidebarOpen;
-              if (state.sidebarOpen) sidebar.classList.remove('md:-mr-[260px]');
-              else sidebar.classList.add('md:-mr-[260px]');
+              if (state.sidebarOpen) {
+                sidebar.classList.remove('md:-mr-[260px]');
+                openBtn.classList.add('md:hidden');
+                newChatTopBtn.classList.add('md:hidden');
+              } else {
+                sidebar.classList.add('md:-mr-[260px]');
+                openBtn.classList.remove('md:hidden');
+                newChatTopBtn.classList.remove('md:hidden');
+              }
             }
           }
 
-          function createNewAnalysis() {
+          function toggleSearchInput() {
+            const box = document.getElementById('sidebar-search-box');
+            box.classList.toggle('hidden');
+            if (!box.classList.contains('hidden')) {
+              document.getElementById('search-threads').focus();
+            }
+          }
+
+          function createNewThread() {
             if (state.isAnalyzing) return;
-            state.activeId = null;
-            saveHistory(); renderHistoryList(); renderActive();
+            state.activeThreadId = null;
+            saveState();
+            renderSidebarThreads();
+            renderActiveThread();
+            if (window.innerWidth < 768) {
+              const sidebar = document.getElementById('sidebar');
+              if (!sidebar.classList.contains('translate-x-full')) toggleSidebar();
+            }
             document.getElementById('prompt-input').focus();
           }
 
-          function selectAnalysis(id) {
+          function selectThread(id) {
             if (state.isAnalyzing) return;
-            state.activeId = id;
-            saveHistory(); renderHistoryList(); renderActive();
+            state.activeThreadId = id;
+            saveState();
+            renderSidebarThreads();
+            renderActiveThread();
             if (window.innerWidth < 768) toggleSidebar();
           }
 
-          function deleteAnalysis(event, id) {
+          function deleteThread(event, id) {
             event.stopPropagation();
-            state.history = state.history.filter(h => h.id !== id);
-            if (state.activeId === id) state.activeId = null;
-            saveHistory(); renderHistoryList(); renderActive();
-            showToast('حذف شد');
+            state.threads = state.threads.filter(t => t.id !== id);
+            if (state.activeThreadId === id) state.activeThreadId = null;
+            saveState();
+            renderSidebarThreads();
+            renderActiveThread();
+            showToast('گفتگو حذف شد');
           }
 
-          function clearHistory() {
-            if (!confirm('همه تاریخچه پاک شود؟')) return;
-            state.history = []; state.activeId = null;
-            saveHistory(); renderHistoryList(); renderActive();
+          function clearAllHistory() {
+            if (!confirm('آیا تمام تاریخچه گفتگوها پاک شود؟')) return;
+            state.threads = [];
+            state.activeThreadId = null;
+            saveState();
+            renderSidebarThreads();
+            renderActiveThread();
             closeSettingsModal();
-            showToast('تاریخچه پاک شد');
+            showToast('تاریخچه پاکسازی شد');
           }
 
-          function renderHistoryList() {
-            const el = document.getElementById('history-list');
-            const q = (document.getElementById('search-scans').value || '').toLowerCase().trim();
-            const filtered = state.history
-              .filter(h => (h.text || '').toLowerCase().includes(q))
-              .sort((a, b) => b.ts - a.ts);
+          function renderSidebarThreads() {
+            const container = document.getElementById('threads-list');
+            const query = (document.getElementById('search-threads')?.value || '').toLowerCase().trim();
+
+            const filtered = state.threads
+              .filter(t => {
+                if (!query) return true;
+                const inTitle = (t.title || '').toLowerCase().includes(query);
+                const inMsgs = (t.messages || []).some(m => (m.text || '').toLowerCase().includes(query));
+                return inTitle || inMsgs;
+              })
+              .sort((a, b) => b.updatedAt - a.updatedAt);
 
             if (!filtered.length) {
-              el.innerHTML = `<div class="text-center py-8 px-3 text-xs text-gray-400">
-                ${q ? 'موردی یافت نشد' : 'هنوز تاریخچه‌ای نیست'}</div>`;
+              container.innerHTML = `
+                <div class="px-3 py-8 text-center text-xs text-token-tertiary">
+                  ${query ? 'موردی یافت نشد' : 'هنوز گفتگویی ثبت نشده است'}
+                </div>`;
               return;
             }
 
-            let html = `<div class="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-gray-400">تحلیل‌های اخیر</div>`;
-            filtered.forEach(h => {
-              const isActive = h.id === state.activeId;
-              const icon = h.result?.decision === 'TOXIC' ? '🚫'
-                         : h.result?.decision === 'SUSPECT' ? '⚠️' : '✅';
-              const preview = (h.text || '').slice(0, 32) + ((h.text || '').length > 32 ? '…' : '');
-              html += `
-                <div onclick="selectAnalysis('${h.id}')" class="group flex items-center justify-between px-3 py-2.5 rounded-xl cursor-pointer text-sm transition-colors ${isActive ? 'bg-gray-200 dark:bg-gpt-hover text-gray-900 dark:text-white font-medium' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-200/60 dark:hover:bg-gpt-hover/60'}">
-                  <div class="flex items-center gap-2.5 truncate pl-2">
-                    <span class="text-xs">${icon}</span>
-                    <span class="truncate text-xs sm:text-sm">${escapeHtml(preview || 'تحلیل')}</span>
-                  </div>
-                  <button onclick="deleteAnalysis(event, '${h.id}')" class="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-red-400">
-                    <i class="fa-regular fa-trash-can text-xs"></i>
-                  </button>
-                </div>`;
+            const now = Date.now();
+            const oneDay = 86400000;
+            const groups = {
+              'امروز': [],
+              '۷ روز گذشته': [],
+              'قدیمی‌تر': []
+            };
+
+            filtered.forEach(t => {
+              const age = now - (t.updatedAt || t.createdAt || now);
+              if (age < oneDay) groups['امروز'].push(t);
+              else if (age < oneDay * 7) groups['۷ روز گذشته'].push(t);
+              else groups['قدیمی‌تر'].push(t);
             });
-            el.innerHTML = html;
+
+            let html = '';
+            for (const [label, items] of Object.entries(groups)) {
+              if (!items.length) continue;
+              html += `<div class="space-y-0.5">
+                <div class="px-2.5 py-1 text-[11px] font-medium text-token-tertiary">${label}</div>`;
+              items.forEach(t => {
+                const isActive = t.id === state.activeThreadId;
+                const lastMsg = t.messages?.[t.messages.length - 1];
+                const badgeDot = lastMsg?.result?.decision === 'TOXIC'
+                  ? 'bg-rose-500'
+                  : lastMsg?.result?.decision === 'SUSPECT'
+                  ? 'bg-amber-400'
+                  : 'bg-emerald-500';
+
+                html += `
+                  <div onclick="selectThread('${t.id}')"
+                       class="group flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer text-[13px] transition-colors ${isActive ? 'bg-token-hover text-token-primary font-medium' : 'text-token-secondary hover:bg-token-hover/60 hover:text-token-primary'}">
+                    <div class="flex items-center gap-2 truncate pl-1">
+                      <span class="w-1.5 h-1.5 rounded-full ${badgeDot} shrink-0"></span>
+                      <span class="truncate">${escapeHtml(t.title || 'تحلیل جدید')}</span>
+                    </div>
+                    <button onclick="deleteThread(event, '${t.id}')"
+                            class="opacity-0 group-hover:opacity-100 text-token-tertiary hover:text-rose-500 px-1 transition-opacity"
+                            title="حذف گفتگو">
+                      <i class="fa-regular fa-trash-can text-xs"></i>
+                    </button>
+                  </div>`;
+              });
+              html += `</div>`;
+            }
+
+            container.innerHTML = html;
           }
 
           /**************************************************************
-           * RENDER
+           * RENDER ACTIVE THREAD (MULTI-TURN CHATGPT STREAM)
            **************************************************************/
-          function renderActive() {
+          function renderActiveThread() {
             const welcome = document.getElementById('welcome-screen');
-            const stream  = document.getElementById('chat-stream');
-            const active  = state.history.find(h => h.id === state.activeId);
-            if (!active) {
+            const stream = document.getElementById('chat-stream');
+            const thread = state.threads.find(t => t.id === state.activeThreadId);
+
+            if (!thread || !thread.messages.length) {
               welcome.classList.remove('hidden');
               stream.classList.add('hidden');
               stream.innerHTML = '';
               return;
             }
+
             welcome.classList.add('hidden');
             stream.classList.remove('hidden');
-            stream.innerHTML = buildAnalysisHTML(active);
+            stream.innerHTML = thread.messages.map(m => buildTurnHTML(m)).join('');
+            scrollToBottom();
           }
 
-          function buildAnalysisHTML(item) {
-            const userBubble = `
-              <div class="flex flex-col items-end w-full animate-fadeIn">
-                <div class="max-w-[85%] sm:max-w-[75%] bg-gray-100 dark:bg-gpt-userBubble text-gray-800 dark:text-gray-100 px-4 py-3 rounded-3xl rounded-br-lg text-sm sm:text-base leading-relaxed whitespace-pre-wrap break-words" dir="auto">${escapeHtml(item.text)}</div>
+          function buildTurnHTML(msg) {
+            const userHTML = `
+              <div class="flex justify-start w-full animate-fadeIn">
+                <div class="max-w-[85%] sm:max-w-[75%] bg-token-surface text-token-primary px-4 py-2.5 rounded-3xl text-[15px] leading-relaxed whitespace-pre-wrap break-words" dir="auto">${escapeHtml(msg.text)}</div>
               </div>`;
 
-            const r = item.result;
+            const r = msg.result;
             if (!r || r.error) {
-              return userBubble + `
-                <div class="flex animate-fadeIn">
-                  <div class="max-w-full bg-red-500/10 border border-red-500/30 text-red-500 px-4 py-3 rounded-2xl text-sm">
-                    ⚠ ${escapeHtml(r?.error || 'خطا')}
-                  </div>
-                </div>`;
-            }
-
-            const colorMap = {
-              TOXIC:   { bg: 'bg-red-500/10',     border: 'border-red-500/30',     text: 'text-red-500',     icon: '🚫', label: 'محتوای سمی' },
-              SUSPECT: { bg: 'bg-amber-500/10',   border: 'border-amber-500/30',   text: 'text-amber-500',   icon: '⚠️', label: 'مشکوک — نیاز به بازبینی' },
-              SAFE:    { bg: 'bg-emerald-500/10', border: 'border-emerald-500/30', text: 'text-emerald-500', icon: '✅', label: 'محتوای سالم' }
-            };
-            const c = colorMap[r.decision];
-
-            const scriptLabel = r.script === 'fa' ? 'فارسی'
-                             : r.script === 'en' ? 'انگلیسی'
-                             : 'مختلط';
-
-            const banner = `
-              <div class="${c.bg} ${c.border} border rounded-2xl px-5 py-4 animate-fadeIn ${r.decision==='TOXIC' ? 'pulse-ring' : ''}">
-                <div class="flex items-center justify-between flex-wrap gap-3">
-                  <div class="flex items-center gap-3">
-                    <span class="text-3xl">${c.icon}</span>
-                    <div>
-                      <div class="${c.text} font-bold text-lg">${c.label}</div>
-                      <div class="text-xs text-gray-500 dark:text-gray-400 mt-1 leading-relaxed">
-                        رأی‌ها: <span class="font-mono font-semibold">${r.votes_count}/${r.total_models}</span>
-                        · حداکثر امتیاز: <span class="font-mono font-semibold">${(r.max_raw*100).toFixed(1)}%</span>
-                        · زبان: <span class="font-semibold">${scriptLabel}</span>
-                        ${r.skipped_models?.length ? `· رد شده: <span class="font-mono">${r.skipped_models.length}</span>` : ''}
+              return `
+                <article class="space-y-4">
+                  ${userHTML}
+                  <div class="flex items-start gap-3.5 animate-fadeIn">
+                    <div class="w-7 h-7 rounded-full border border-token-border bg-token-surface flex items-center justify-center text-xs shrink-0 mt-0.5">
+                      <i class="fa-solid fa-shield-halved"></i>
+                    </div>
+                    <div class="flex-1 min-w-0">
+                      <div class="bg-rose-500/10 border border-rose-500/20 text-rose-500 px-4 py-3 rounded-2xl text-sm">
+                        خطا در پردازش: ${escapeHtml(r?.error || 'پاسخی از سرور دریافت نشد')}
                       </div>
                     </div>
                   </div>
-                  <div class="text-left">
-                    <div class="text-[10px] uppercase tracking-wider text-gray-400">اعتماد</div>
-                    <div class="font-mono font-bold ${c.text} text-xl">${(r.confidence*100).toFixed(1)}%</div>
-                  </div>
-                </div>
-              </div>`;
+                </article>`;
+            }
 
-            const rows = Object.keys(r.raw_scores).map(name => {
-              const raw = r.raw_scores[name];
-              const w   = r.weighted_scores[name];
-              const lbl = r.labels?.[name] || name;
-              const voted = r.votes[name];
-              const cls   = voted ? 'text-red-500' : (raw >= 0.6 ? 'text-amber-500' : 'text-emerald-500');
-              const bgbar = voted ? 'bg-red-500' : (raw >= 0.6 ? 'bg-amber-500' : 'bg-emerald-500');
-              const rawPct = Math.min(100, raw * 100);
+            const decisionMeta = {
+              TOXIC: {
+                badgeBg: 'bg-rose-500/15 text-rose-500 border-rose-500/30',
+                barColor: 'bg-rose-500',
+                title: 'محتوای سمی شناسایی شد (TOXIC)',
+                summary: 'بر اساس رأی‌گیری اجماعی، این متن حاوی الفاظ توهین‌آمیز یا سمی تشخیص داده شد.'
+              },
+              SUSPECT: {
+                badgeBg: 'bg-amber-500/15 text-amber-500 border-amber-500/30',
+                barColor: 'bg-amber-500',
+                title: 'محتوای مشکوک — نیازمند بازبینی (SUSPECT)',
+                summary: 'برخی مدل‌ها احتمال سمیت متوسطی را تشخیص داده‌اند اما اجماع کامل وجود ندارد.'
+              },
+              SAFE: {
+                badgeBg: 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30',
+                barColor: 'bg-emerald-500',
+                title: 'محتوای سالم و محترمانه (SAFE)',
+                summary: 'هیچ‌یک از مدل‌های ensemble نشانه‌ای از توهین یا سمیت در این متن نیافتند.'
+              }
+            }[r.decision];
+
+            const scriptLabel = r.script === 'fa' ? 'فارسی' : r.script === 'en' ? 'انگلیسی' : 'چندزبانه / مختلط';
+
+            const modelRows = Object.keys(r.raw_scores || {}).map(key => {
+              const raw = r.raw_scores[key];
+              const weightScore = r.weighted_scores[key];
+              const voted = r.votes[key];
+              const label = r.labels?.[key] || key;
+              const pct = Math.min(100, (raw * 100)).toFixed(1);
+              const barColor = voted ? 'bg-rose-500' : (raw >= 0.35 ? 'bg-amber-500' : 'bg-emerald-500');
+              const badge = voted
+                ? `<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-rose-500/15 text-rose-500">رأی سمی</span>`
+                : `<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/15 text-emerald-500">سالم</span>`;
+
               return `
-                <div class="py-3 border-b border-gray-200 dark:border-white/5 last:border-0">
-                  <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
-                    <div class="flex items-center gap-2">
-                      <span class="text-sm">${voted ? '🚩' : '✅'}</span>
-                      <span class="text-xs font-semibold text-gray-700 dark:text-gray-200">${escapeHtml(lbl)}</span>
+                <div class="py-2.5 border-b border-token-border last:border-0">
+                  <div class="flex items-center justify-between gap-2 mb-1.5">
+                    <div class="flex items-center gap-2 min-w-0">
+                      ${badge}
+                      <span class="text-xs font-medium text-token-primary truncate">${escapeHtml(label)}</span>
                     </div>
-                    <div class="flex items-center gap-3 text-[11px] font-mono">
-                      <span class="text-gray-400">خام ${(raw*100).toFixed(1)}%</span>
-                      <span class="${cls} font-bold">${(w*100).toFixed(1)}%</span>
+                    <div class="flex items-center gap-2.5 text-[11px] font-mono shrink-0">
+                      <span class="text-token-tertiary">خام: ${pct}%</span>
+                      <span class="text-token-primary font-semibold">وزنی: ${(weightScore * 100).toFixed(1)}%</span>
                     </div>
                   </div>
-                  <div class="w-full h-1.5 bg-gray-200 dark:bg-white/5 rounded-full overflow-hidden">
-                    <div class="${bgbar} h-full score-bar" style="width: ${rawPct}%"></div>
+                  <div class="w-full h-1.5 bg-token-main rounded-full overflow-hidden">
+                    <div class="${barColor} h-full score-bar" style="width: ${pct}%"></div>
                   </div>
                 </div>`;
             }).join('');
 
-            const skippedHtml = (r.skipped_models && r.skipped_models.length) ? `
-              <div class="mt-3 pt-3 border-t border-gray-200 dark:border-white/5 text-[11px] text-gray-400">
-                <i class="fa-solid fa-circle-info mr-1"></i>
-                مدل‌های رد شده (ناسازگار با زبان): ${r.skipped_models.join(', ')}
+            const skippedNotice = (r.skipped_models && r.skipped_models.length)
+              ? `<div class="mt-2.5 pt-2 border-t border-token-border text-[11px] text-token-tertiary flex items-center gap-1.5">
+                   <i class="fa-solid fa-filter text-[10px]"></i>
+                   <span>فیلتر هوشمند زبان (${scriptLabel}): مدل‌های <code class="font-mono">${r.skipped_models.join(', ')}</code> نادیده گرفته شدند.</span>
+                 </div>`
+              : '';
+
+            const detailsSection = state.viewMode === 'detailed' ? `
+              <div class="mt-3 bg-token-surface/70 border border-token-border rounded-2xl p-4">
+                <div class="flex items-center justify-between mb-2">
+                  <span class="text-xs font-semibold text-token-secondary">ریز نمرات ۵ مدل (Ensemble Breakdown)</span>
+                  <span class="text-[11px] font-mono text-token-tertiary">${r.latency_ms ? r.latency_ms + 'ms' : ''}</span>
+                </div>
+                ${modelRows}
+                ${skippedNotice}
               </div>` : '';
 
-            const breakdown = `
-              <div class="bg-gray-50 dark:bg-gpt-input/40 border border-gray-200 dark:border-white/10 rounded-2xl p-4 animate-fadeIn">
-                <div class="flex items-center justify-between mb-3">
-                  <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">جزئیات رأی مدل‌ها</h3>
-                  <button onclick="copyJSON('${item.id}')" class="text-[11px] text-gray-400 hover:text-gpt-accent flex items-center gap-1">
-                    <i class="fa-regular fa-copy"></i> کپی JSON
-                  </button>
-                </div>
-                ${rows}
-                ${skippedHtml}
-              </div>`;
-
-            const meta = `
-              <div class="text-[10px] text-gray-400 dark:text-gray-500 text-center">
-                ${new Date(item.ts).toLocaleString('fa-IR')}
-              </div>`;
-
             return `
-              ${userBubble}
-              <div class="flex flex-col gap-3 animate-fadeIn">${banner}${breakdown}${meta}</div>`;
+              <article class="space-y-4 animate-fadeIn">
+                ${userHTML}
+
+                <!-- Assistant Response Row -->
+                <div class="flex items-start gap-3.5">
+                  <div class="w-7 h-7 rounded-full border border-token-border bg-token-surface text-token-primary flex items-center justify-center text-xs shrink-0 mt-0.5">
+                    <i class="fa-solid fa-shield-halved"></i>
+                  </div>
+
+                  <div class="flex-1 min-w-0 space-y-2">
+                    <!-- Main Verdict Card -->
+                    <div class="border border-token-border bg-token-surface/40 rounded-2xl p-4">
+                      <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+                        <span class="px-2.5 py-1 rounded-full text-xs font-semibold border ${decisionMeta.badgeBg}">
+                          ${decisionMeta.title}
+                        </span>
+                        <span class="text-xs font-mono text-token-secondary">
+                          اطمینان: <strong>${(r.confidence * 100).toFixed(1)}%</strong>
+                        </span>
+                      </div>
+
+                      <p class="text-[13.5px] text-token-secondary leading-relaxed mb-3">
+                        ${decisionMeta.summary}
+                      </p>
+
+                      <!-- Quick Metrics Pills -->
+                      <div class="grid grid-cols-3 gap-2 text-center bg-token-main/60 p-2.5 rounded-xl border border-token-border">
+                        <div>
+                          <div class="text-[10px] text-token-tertiary">آرای سمیت</div>
+                          <div class="text-xs font-mono font-bold text-token-primary mt-0.5">${r.votes_count} از ${r.total_models}</div>
+                        </div>
+                        <div>
+                          <div class="text-[10px] text-token-tertiary">بیشترین نمره خام</div>
+                          <div class="text-xs font-mono font-bold text-token-primary mt-0.5">${(r.max_raw * 100).toFixed(1)}%</div>
+                        </div>
+                        <div>
+                          <div class="text-[10px] text-token-tertiary">زبان تشخیص‌داده‌شده</div>
+                          <div class="text-xs font-semibold text-token-primary mt-0.5">${scriptLabel}</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    ${detailsSection}
+
+                    <!-- ChatGPT Message Action Bar -->
+                    <div class="flex items-center gap-1 pt-0.5 text-token-tertiary">
+                      <button onclick="copyReport('${msg.id}')"
+                              class="p-1.5 rounded-lg hover:bg-token-hover hover:text-token-primary transition-colors text-xs flex items-center gap-1"
+                              title="کپی گزارش">
+                        <i class="fa-regular fa-copy"></i>
+                      </button>
+                      <button onclick="copyMessageJSON('${msg.id}')"
+                              class="p-1.5 rounded-lg hover:bg-token-hover hover:text-token-primary transition-colors text-xs flex items-center gap-1"
+                              title="کپی JSON خام">
+                        <i class="fa-solid fa-code"></i>
+                      </button>
+                      <button onclick="reAnalyze('${msg.id}')"
+                              class="p-1.5 rounded-lg hover:bg-token-hover hover:text-token-primary transition-colors text-xs"
+                              title="تحلیل مجدد">
+                        <i class="fa-solid fa-rotate-right"></i>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </article>`;
           }
 
           /**************************************************************
-           * ANALYZE
+           * ANALYZE SUBMISSION
            **************************************************************/
-          async function analyze() {
+          async function analyze(overrideText) {
             const input = document.getElementById('prompt-input');
-            const text = input.value.trim();
+            const text = (typeof overrideText === 'string' ? overrideText : input.value).trim();
             if (!text || state.isAnalyzing) return;
 
             state.isAnalyzing = true;
             document.getElementById('send-btn').disabled = true;
-            showLoadingBubble(text);
+
+            if (typeof overrideText !== 'string') {
+              input.value = '';
+              autoResize(input);
+            }
+
+            // Ensure an active thread exists
+            let thread = state.threads.find(t => t.id === state.activeThreadId);
+            if (!thread) {
+              thread = {
+                id: 'th_' + Date.now(),
+                title: text.slice(0, 34) + (text.length > 34 ? '…' : ''),
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                messages: []
+              };
+              state.threads.unshift(thread);
+              state.activeThreadId = thread.id;
+            }
+
+            appendPendingTurn(text);
 
             try {
               const r = await fetch('/api/check', {
@@ -888,114 +1164,219 @@ jobs:
                 body: JSON.stringify({ text })
               });
               const result = await r.json();
-              const item = { id: 'an_' + Date.now(), text, result, ts: Date.now() };
-              state.history.unshift(item);
-              state.activeId = item.id;
-              saveHistory(); renderHistoryList(); renderActive();
-              input.value = ''; autoResize(input);
+
+              const msgObj = {
+                id: 'msg_' + Date.now(),
+                text,
+                result,
+                ts: Date.now()
+              };
+              thread.messages.push(msgObj);
+              thread.updatedAt = Date.now();
+
+              saveState();
+              renderSidebarThreads();
+              renderActiveThread();
             } catch (e) {
-              showToast('خطای سرور');
+              showToast('خطا در ارتباط با سرور');
+              renderActiveThread();
             } finally {
               state.isAnalyzing = false;
-              document.getElementById('send-btn').disabled = false;
+              autoResize(document.getElementById('prompt-input'));
               document.getElementById('prompt-input').focus();
             }
           }
 
-          function showLoadingBubble(text) {
+          function appendPendingTurn(text) {
             const welcome = document.getElementById('welcome-screen');
-            const stream  = document.getElementById('chat-stream');
+            const stream = document.getElementById('chat-stream');
             welcome.classList.add('hidden');
             stream.classList.remove('hidden');
-            stream.innerHTML = `
-              <div class="flex flex-col items-end w-full">
-                <div class="max-w-[85%] bg-gray-100 dark:bg-gpt-userBubble text-gray-800 dark:text-gray-100 px-4 py-3 rounded-3xl rounded-br-lg text-sm whitespace-pre-wrap" dir="auto">${escapeHtml(text)}</div>
+
+            const pendingDiv = document.createElement('div');
+            pendingDiv.id = 'pending-turn';
+            pendingDiv.className = 'space-y-4 animate-fadeIn';
+            pendingDiv.innerHTML = `
+              <div class="flex justify-start w-full">
+                <div class="max-w-[85%] sm:max-w-[75%] bg-token-surface text-token-primary px-4 py-2.5 rounded-3xl text-[15px] leading-relaxed whitespace-pre-wrap" dir="auto">${escapeHtml(text)}</div>
               </div>
-              <div class="flex items-center gap-2 text-gray-400 text-sm animate-fadeIn">
-                <div class="w-2 h-2 rounded-full bg-gpt-accent typing-dot"></div>
-                <div class="w-2 h-2 rounded-full bg-gpt-accent typing-dot"></div>
-                <div class="w-2 h-2 rounded-full bg-gpt-accent typing-dot"></div>
-                <span class="text-xs mr-2">۵ مدل در حال بررسی…</span>
+              <div class="flex items-center gap-3.5">
+                <div class="w-7 h-7 rounded-full border border-token-border bg-token-surface text-token-primary flex items-center justify-center text-xs shrink-0">
+                  <i class="fa-solid fa-shield-halved"></i>
+                </div>
+                <div class="flex items-center gap-1.5 py-2">
+                  <span class="w-2 h-2 rounded-full bg-token-secondary typing-dot"></span>
+                  <span class="w-2 h-2 rounded-full bg-token-secondary typing-dot"></span>
+                  <span class="w-2 h-2 rounded-full bg-token-secondary typing-dot"></span>
+                </div>
               </div>`;
-            const el = document.getElementById('messages-container');
-            el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+            stream.appendChild(pendingDiv);
+            scrollToBottom();
+          }
+
+          function reAnalyze(msgId) {
+            const thread = state.threads.find(t => t.id === state.activeThreadId);
+            if (!thread) return;
+            const msg = thread.messages.find(m => m.id === msgId);
+            if (!msg) return;
+            analyze(msg.text);
           }
 
           /**************************************************************
-           * INPUT
+           * COMPOSER & UI HELPERS
            **************************************************************/
           function autoResize(el) {
             el.style.height = 'auto';
-            el.style.height = Math.min(el.scrollHeight, 192) + 'px';
+            el.style.height = Math.min(el.scrollHeight, 176) + 'px';
             const v = el.value;
-            const c = document.getElementById('char-counter');
-            if (v.length > 0) { c.textContent = v.length + ' کاراکتر'; c.classList.remove('hidden'); }
-            else c.classList.add('hidden');
+            const counter = document.getElementById('char-counter');
+            if (v.length > 0) {
+              counter.textContent = v.length;
+              counter.classList.remove('hidden');
+            } else {
+              counter.classList.add('hidden');
+            }
             document.getElementById('send-btn').disabled = !v.trim() || state.isAnalyzing;
           }
+
           function handleKey(e) {
-            if (e.key === 'Enter' && (e.ctrlKey || !e.shiftKey)) {
+            if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
               analyze();
             }
           }
+
           function useStarter(text) {
-            const input = document.getElementById('prompt-input');
-            input.value = text;
-            autoResize(input);
-            input.focus();
+            analyze(text);
           }
 
-          /**************************************************************
-           * UTILITIES
-           **************************************************************/
-          function escapeHtml(s) {
-            return String(s).replace(/[&<>"']/g, ch => ({
-              '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-            }[ch]));
+          async function pasteClipboard() {
+            try {
+              const t = await navigator.clipboard.readText();
+              if (t) {
+                const input = document.getElementById('prompt-input');
+                input.value = t;
+                autoResize(input);
+                input.focus();
+              }
+            } catch (e) {
+              showToast('دسترسی به کلیپ‌بورد امکان‌پذیر نیست');
+            }
           }
+
+          function toggleModelDropdown(e) {
+            e.stopPropagation();
+            document.getElementById('model-dropdown').classList.toggle('hidden');
+          }
+
+          function setViewMode(mode) {
+            state.viewMode = mode;
+            saveState();
+            updateViewModeCheckmarks();
+            renderActiveThread();
+            document.getElementById('model-dropdown').classList.add('hidden');
+          }
+
+          function updateViewModeCheckmarks() {
+            const d = document.getElementById('check-detailed');
+            const c = document.getElementById('check-compact');
+            if (!d || !c) return;
+            if (state.viewMode === 'detailed') {
+              d.classList.remove('hidden');
+              c.classList.add('hidden');
+            } else {
+              d.classList.add('hidden');
+              c.classList.remove('hidden');
+            }
+          }
+
+          function scrollToBottom() {
+            const container = document.getElementById('messages-container');
+            container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+          }
+
+          function findMessage(msgId) {
+            for (const t of state.threads) {
+              const found = t.messages.find(m => m.id === msgId);
+              if (found) return found;
+            }
+            return null;
+          }
+
+          function copyMessageJSON(msgId) {
+            const msg = findMessage(msgId);
+            if (!msg) return;
+            navigator.clipboard.writeText(JSON.stringify(msg.result, null, 2));
+            showToast('JSON در کلیپ‌بورد کپی شد');
+          }
+
+          function copyReport(msgId) {
+            const msg = findMessage(msgId);
+            if (!msg || !msg.result) return;
+            const r = msg.result;
+            const txt = `متن: "${msg.text}"\nنتیجه: ${r.decision} (اطمینان: ${(r.confidence * 100).toFixed(1)}% | آرا: ${r.votes_count}/${r.total_models})`;
+            navigator.clipboard.writeText(txt);
+            showToast('گزارش کپی شد');
+          }
+
+          function exportCurrentThread() {
+            const thread = state.threads.find(t => t.id === state.activeThreadId);
+            if (!thread) {
+              showToast('گفتگویی برای خروجی گرفتن انتخاب نشده است');
+              return;
+            }
+            const blob = new Blob([JSON.stringify(thread, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `polyguard_${thread.id}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+            showToast('فایل JSON دانلود شد');
+          }
+
+          function toggleTheme() {
+            const root = document.documentElement;
+            root.classList.toggle('dark');
+            const icon = document.getElementById('theme-icon');
+            icon.className = root.classList.contains('dark') ? 'fa-regular fa-sun text-sm' : 'fa-regular fa-moon text-sm';
+          }
+
+          function openSettingsModal() {
+            const m = document.getElementById('settings-modal');
+            m.classList.remove('hidden');
+            m.classList.add('flex');
+          }
+
+          function openModelsModal() {
+            openSettingsModal();
+          }
+
+          function closeSettingsModal() {
+            const m = document.getElementById('settings-modal');
+            m.classList.add('hidden');
+            m.classList.remove('flex');
+          }
+
           function showToast(msg) {
             const t = document.getElementById('toast');
             document.getElementById('toast-message').textContent = msg;
             t.classList.remove('hidden');
             t.classList.add('flex');
-            setTimeout(() => { t.classList.add('hidden'); t.classList.remove('flex'); }, 2200);
+            setTimeout(() => {
+              t.classList.add('hidden');
+              t.classList.remove('flex');
+            }, 2200);
           }
-          function copyJSON(id) {
-            const item = state.history.find(h => h.id === id);
-            if (!item) return;
-            navigator.clipboard.writeText(JSON.stringify(item.result, null, 2));
-            showToast('JSON کپی شد');
-          }
-          function exportCurrent() {
-            const item = state.history.find(h => h.id === state.activeId);
-            if (!item) { showToast('چیزی برای خروجی نیست'); return; }
-            const blob = new Blob([JSON.stringify(item, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `polyguard_${item.id}.json`;
-            a.click();
-            URL.revokeObjectURL(url);
-            showToast('خروجی گرفته شد');
-          }
-          function toggleTheme() {
-            const root = document.documentElement;
-            root.classList.toggle('dark');
-            const icon = document.getElementById('theme-icon');
-            icon.className = root.classList.contains('dark') ? 'fa-solid fa-sun text-sm' : 'fa-solid fa-moon text-sm';
-          }
-          function openSettingsModal() {
-            document.getElementById('settings-modal').classList.remove('hidden');
-            document.getElementById('settings-modal').classList.add('flex');
-          }
-          function closeSettingsModal() {
-            document.getElementById('settings-modal').classList.add('hidden');
-            document.getElementById('settings-modal').classList.remove('flex');
+
+          function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, ch => ({
+              '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[ch]));
           }
           JSEOF
 
-          echo "✔ All app files created"
+          echo "✔ All ChatGPT-themed app files created"
           ls -R app
 
       - name: Install cloudflared
@@ -1022,7 +1403,7 @@ jobs:
               exit 1
             fi
             if [ $((i % 10)) -eq 0 ]; then
-              echo "  ... still loading (${i}/150) — $STATUS"
+              echo "  ... still loading (${i}/150) —$STATUS"
             fi
             sleep 2
           done
