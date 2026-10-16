@@ -19,9 +19,11 @@ env:
 
   MODELS_ROOT: ${{ github.workspace }}/models
 
-  # CPU tuning for 4-core / 16GB runner
-  OMP_NUM_THREADS: "4"
-  MKL_NUM_THREADS: "4"
+  # ---- CONCURRENCY: 1 thread per inference, so N inferences run in parallel ----
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  NUMEXPR_NUM_THREADS: "1"
   TOKENIZERS_PARALLELISM: "false"
 
 jobs:
@@ -42,7 +44,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
-          pip install --quiet fastapi "uvicorn[standard]" transformers sentencepiece protobuf huggingface_hub
+          pip install --quiet fastapi "uvicorn[standard]" gunicorn transformers sentencepiece protobuf huggingface_hub anyio
 
       - name: Download all models to local folders
         run: |
@@ -78,44 +80,64 @@ jobs:
 
           # ==================================================================
           # BACKEND — FastAPI + consensus voting + language-aware routing
+          # FULLY CONCURRENT: def endpoints (threadpool) + per-inference 1 thread
+          # + semaphore limiting parallel inferences to CPU count
           # ==================================================================
           cat > app/main.py << 'PYEOF'
           import os
+
+          # ---- CRITICAL: 1 thread per inference so N inferences run truly in parallel ----
           os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+          os.environ.setdefault("OMP_NUM_THREADS", "1")
+          os.environ.setdefault("MKL_NUM_THREADS", "1")
+          os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+          os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
           os.environ.setdefault("HF_HUB_OFFLINE", "1")
           os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-          os.environ.setdefault("OMP_NUM_THREADS", "4")
-          os.environ.setdefault("MKL_NUM_THREADS", "4")
 
           import re
           import time
           import threading
           from contextlib import asynccontextmanager
           from pathlib import Path
-          from typing import Dict
+          from typing import Dict, List
+
           import torch
+          torch.set_num_threads(1)      # <-- per-inference single thread
+
+          from anyio import to_thread
           from fastapi import FastAPI
           from fastapi.staticfiles import StaticFiles
           from fastapi.responses import FileResponse
           from pydantic import BaseModel
           from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-          torch.set_num_threads(4)
+          # ------------------------------------------------------------------
+          # Concurrency control
+          # ------------------------------------------------------------------
+          CPU_COUNT = os.cpu_count() or 4
+          MAX_CONCURRENT_INFERENCES = max(2, CPU_COUNT)      # e.g. 4 on GH runner
+          MAX_THREADPOOL_TOKENS     = 200                    # how many requests can be "in flight"
+
+          _infer_sem = threading.Semaphore(MAX_CONCURRENT_INFERENCES)
+          _state_lock = threading.Lock()
 
           BASE_DIR    = Path(__file__).resolve().parent
           MODELS_ROOT = Path(os.environ["MODELS_ROOT"])
 
-          class TextIn(BaseModel):
-              text: str
 
-          state = {"models": {}, "errors": {}, "ready": False}
+          class TextIn(BaseModel):
+              text: str          # NO length limit — passed as-is
+
+
+          state = {"models": {}, "errors": {}, "ready": False, "inflight": 0, "peak": 0}
 
           MODEL_SPECS = {
-              "persian":      {"dir": MODELS_ROOT / "persian",           "mode": "multilabel", "weight": 2.0, "lang": "fa",    "label": "Persian ParsBERT (تخصصی فارسی)",        "label_en": "Persian ParsBERT"},
-              "textdetox_lg": {"dir": MODELS_ROOT / "textdetox_large",   "mode": "binary",     "weight": 2.0, "lang": "multi", "label": "TextDetox XLM-R Large (۱۵ زبان)",       "label_en": "TextDetox XLM-R Large"},
-              "textdetox_sm": {"dir": MODELS_ROOT / "textdetox_base",    "mode": "binary",     "weight": 1.5, "lang": "multi", "label": "TextDetox XLM-R Base (۱۵ زبان)",        "label_en": "TextDetox XLM-R Base"},
-              "multilingual": {"dir": MODELS_ROOT / "multilingual",      "mode": "multilabel", "weight": 1.0, "lang": "multi", "label": "Unitary XLM-R (چندزبانه ۱۰۰+)",         "label_en": "Unitary XLM-R"},
-              "twitter_off":  {"dir": MODELS_ROOT / "twitter_offensive", "mode": "binary",     "weight": 1.0, "lang": "en",    "label": "Twitter RoBERTa Offensive (انگلیسی)",   "label_en": "Twitter RoBERTa Offensive"},
+              "persian":      {"dir": MODELS_ROOT / "persian",           "mode": "multilabel", "weight": 2.0, "lang": "fa",    "label": "Persian ParsBERT (تخصصی فارسی)",  "label_en": "Persian ParsBERT"},
+              "textdetox_lg": {"dir": MODELS_ROOT / "textdetox_large",   "mode": "binary",     "weight": 2.0, "lang": "multi", "label": "TextDetox XLM-R Large (۱۵ زبان)", "label_en": "TextDetox XLM-R Large"},
+              "textdetox_sm": {"dir": MODELS_ROOT / "textdetox_base",    "mode": "binary",     "weight": 1.5, "lang": "multi", "label": "TextDetox XLM-R Base (۱۵ زبان)",  "label_en": "TextDetox XLM-R Base"},
+              "multilingual": {"dir": MODELS_ROOT / "multilingual",      "mode": "multilabel", "weight": 1.0, "lang": "multi", "label": "Unitary XLM-R (چندزبانه ۱۰۰+)",   "label_en": "Unitary XLM-R"},
+              "twitter_off":  {"dir": MODELS_ROOT / "twitter_offensive", "mode": "binary",     "weight": 1.0, "lang": "en",    "label": "Twitter RoBERTa Offensive (انگلیسی)", "label_en": "Twitter RoBERTa Offensive"},
           }
 
           # ---------- consensus rules ----------
@@ -123,6 +145,7 @@ jobs:
           MIN_VOTES_FOR_TOXIC      = 2
           STRONG_SINGLE_MODEL      = 0.90
           WEAK_SUSPECT_THRESHOLD   = 0.60
+
 
           def _load_one(name, spec):
               try:
@@ -132,35 +155,42 @@ jobs:
                       str(spec["dir"]), local_files_only=True
                   )
                   mdl.eval()
-                  state["models"][name] = (
-                      mdl, tok, spec["mode"], spec["weight"],
-                      spec["lang"], spec["label"], spec["label_en"]
-                  )
+                  with _state_lock:
+                      state["models"][name] = (
+                          mdl, tok, spec["mode"], spec["weight"],
+                          spec["lang"], spec["label"], spec["label_en"]
+                      )
                   print(f"[Ensemble] ✔ '{name}' loaded", flush=True)
               except Exception as exc:
-                  state["errors"][name] = str(exc)
+                  with _state_lock:
+                      state["errors"][name] = str(exc)
                   print(f"[Ensemble] ✖ '{name}' FAILED: {exc}", flush=True)
+
 
           def load_all():
               for name, spec in MODEL_SPECS.items():
                   _load_one(name, spec)
-              state["ready"] = True
+              with _state_lock:
+                  state["ready"] = True
               print(f"[Ensemble] All done. Loaded: {list(state['models'].keys())}", flush=True)
+
 
           def _score_multilabel(model, tokenizer, text):
               inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-              with torch.no_grad():
+              with torch.inference_mode():
                   logits = model(**inputs).logits
               return float(torch.sigmoid(logits).squeeze(0).max().item())
 
+
           def _score_binary(model, tokenizer, text):
               inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-              with torch.no_grad():
+              with torch.inference_mode():
                   logits = model(**inputs).logits
               probs = torch.softmax(logits, dim=-1).squeeze(0)
               if probs.numel() == 1:
                   return float(probs.item())
               return float(probs[1].item())
+
 
           def _detect_script(text: str) -> str:
               fa = len(re.findall(r'[\u0600-\u06FF]', text))
@@ -174,12 +204,17 @@ jobs:
                   return "en"
               return "mixed"
 
+
           def ensemble_predict(text: str) -> Dict:
               t0 = time.perf_counter()
               script = _detect_script(text)
 
+              # snapshot of models under lock (thread-safe read)
+              with _state_lock:
+                  models_snapshot = list(state["models"].items())
+
               raw, weighted, labels, labels_en, skipped = {}, {}, {}, {}, []
-              for name, (mdl, tok, mode, weight, lang, label, label_en) in state["models"].items():
+              for name, (mdl, tok, mode, weight, lang, label, label_en) in models_snapshot:
                   if script == "fa" and lang == "en":
                       skipped.append(name)
                       continue
@@ -194,10 +229,10 @@ jobs:
                       print(f"[Ensemble] inference error in {name}: {exc}", flush=True)
                       s = 0.0
 
-                  raw[name]        = round(s, 4)
-                  weighted[name]   = round(s * weight, 4)
-                  labels[name]     = label
-                  labels_en[name]  = label_en
+                  raw[name]       = round(s, 4)
+                  weighted[name]  = round(s * weight, 4)
+                  labels[name]    = label
+                  labels_en[name] = label_en
 
               if not raw:
                   return {"error": "no models applicable", "details": state["errors"]}
@@ -242,40 +277,75 @@ jobs:
                   "errors":          state["errors"],
               }
 
+
           @asynccontextmanager
           async def lifespan(app: FastAPI):
+              # Raise the threadpool so many requests can sit on the semaphore
+              to_thread.current_default_thread_limiter().total_tokens = MAX_THREADPOOL_TOKENS
+              # warm up loads in the background
               threading.Thread(target=load_all, daemon=True).start()
+              print(f"[Ensemble] Concurrency: cpu={CPU_COUNT}, "
+                    f"parallel_inferences={MAX_CONCURRENT_INFERENCES}, "
+                    f"threadpool={MAX_THREADPOOL_TOKENS}", flush=True)
               yield
 
+
           app = FastAPI(title="PolyGuard Ensemble", lifespan=lifespan)
+
 
           @app.get("/health")
           def health():
               if not state["ready"]:
-                  return {"status": "loading", "loaded": list(state["models"].keys())}
+                  return {
+                      "status": "loading",
+                      "loaded": list(state["models"].keys()),
+                      "inflight": state["inflight"],
+                      "peak": state["peak"],
+                      "concurrency": MAX_CONCURRENT_INFERENCES,
+                  }
               if not state["models"]:
                   return {"status": "error", "detail": state["errors"]}
               return {
                   "status": "ok",
                   "loaded_models": list(state["models"].keys()),
                   "errors": state["errors"],
+                  "inflight": state["inflight"],
+                  "peak": state["peak"],
+                  "concurrency": MAX_CONCURRENT_INFERENCES,
               }
 
+
+          # ------------------------------------------------------------------
+          # IMPORTANT: this endpoint is `def` (not `async def`).
+          # FastAPI will run each request in its own thread from the AnyIO
+          # threadpool → the event loop is never blocked.
+          # The semaphore then limits how many inferences run at the same time.
+          # ------------------------------------------------------------------
           @app.post("/api/check")
-          async def check(data: TextIn):
-              if not state["models"]:
+          def check(data: TextIn):
+              if not state["ready"] or not state["models"]:
                   return {"error": state["errors"] or "no models loaded yet"}
-              return ensemble_predict(data.text)
+
+              with _infer_sem:
+                  state["inflight"] += 1
+                  if state["inflight"] > state["peak"]:
+                      state["peak"] = state["inflight"]
+                  try:
+                      return ensemble_predict(data.text)
+                  finally:
+                      state["inflight"] -= 1
+
 
           @app.get("/")
           def index():
               return FileResponse(BASE_DIR / "static" / "index.html")
 
+
           app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
           PYEOF
 
           # ==================================================================
-          # FRONTEND — Full ChatGPT (chatgpt.com) UI Clone + Vazirmatn Font
+          # FRONTEND — ChatGPT UI clone (unchanged)
           # ==================================================================
           cat > app/static/index.html << 'HTMLEOF'
           <!DOCTYPE html>
@@ -367,15 +437,12 @@ jobs:
 
           <body class="bg-token-main text-token-primary h-screen w-screen overflow-hidden flex antialiased selection:bg-emerald-500/20">
 
-              <!-- Mobile Backdrop -->
               <div id="mobile-backdrop" onclick="toggleSidebar()"
                    class="fixed inset-0 bg-black/50 z-30 hidden md:hidden transition-opacity"></div>
 
-              <!-- ================= LEFT/RIGHT COLLAPSIBLE SIDEBAR (ChatGPT #171717) ================= -->
               <aside id="sidebar"
                      class="fixed md:static inset-y-0 right-0 z-40 w-[260px] bg-token-sidebar flex flex-col transition-all duration-200 ease-in-out shrink-0 transform translate-x-full md:translate-x-0 border-l border-token-border select-none">
 
-                  <!-- Sidebar Top Bar (Collapse + New Chat Icons) -->
                   <div class="h-14 px-3 flex items-center justify-between">
                       <button onclick="toggleSidebar()"
                               class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
@@ -400,7 +467,6 @@ jobs:
                       </div>
                   </div>
 
-                  <!-- Search Drawer (Hidden by default) -->
                   <div id="sidebar-search-box" class="px-3 pb-2 hidden">
                       <div class="relative">
                           <i class="fa-solid fa-magnifying-glass absolute right-3 top-1/2 -translate-y-1/2 text-xs text-token-tertiary"></i>
@@ -410,7 +476,6 @@ jobs:
                       </div>
                   </div>
 
-                  <!-- Pinned Brand / GPT Item -->
                   <div class="px-2 pb-1">
                       <button onclick="createNewThread()"
                               class="w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-sm text-token-primary hover:bg-token-hover transition-colors group">
@@ -432,10 +497,8 @@ jobs:
                       </button>
                   </div>
 
-                  <!-- Chronological Chat Threads List -->
                   <div id="threads-list" class="flex-1 overflow-y-auto px-2 py-2 space-y-4"></div>
 
-                  <!-- Sidebar Footer: Live Model Status + User Profile Pill -->
                   <div class="p-2 border-t border-token-border space-y-1">
                       <div onclick="openSettingsModal()"
                            class="flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-token-hover cursor-pointer transition-colors">
@@ -456,13 +519,10 @@ jobs:
                   </div>
               </aside>
 
-              <!-- ================= CENTRAL CHAT WORKSPACE (ChatGPT #212121) ================= -->
               <main class="flex-1 flex flex-col h-full min-w-0 bg-token-main relative">
 
-                  <!-- Top Sticky Header -->
                   <header class="h-14 px-3 sm:px-4 flex items-center justify-between shrink-0 z-20">
                       <div class="flex items-center gap-1">
-                          <!-- Show when sidebar is collapsed on desktop or mobile -->
                           <button id="open-sidebar-btn" onclick="toggleSidebar()"
                                   class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors md:hidden"
                                   title="باز کردن نوار کناری">
@@ -477,7 +537,6 @@ jobs:
                               <i class="fa-regular fa-pen-to-square text-sm"></i>
                           </button>
 
-                          <!-- ChatGPT Model Selector Dropdown Button -->
                           <div class="relative">
                               <button onclick="toggleModelDropdown(event)"
                                       class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-base font-semibold text-token-primary hover:bg-token-hover transition-colors">
@@ -486,7 +545,6 @@ jobs:
                                   <i class="fa-solid fa-chevron-down text-[11px] text-token-tertiary mr-0.5"></i>
                               </button>
 
-                              <!-- Dropdown Menu -->
                               <div id="model-dropdown"
                                    class="hidden absolute right-0 mt-1.5 w-72 bg-token-surface border border-token-border rounded-2xl shadow-2xl p-1.5 z-50 animate-fadeIn">
                                   <div class="px-3 py-1.5 text-[11px] text-token-tertiary font-medium">معماری تشخیص</div>
@@ -516,7 +574,6 @@ jobs:
                           </div>
                       </div>
 
-                      <!-- Top-Left Utility Buttons -->
                       <div class="flex items-center gap-1">
                           <button onclick="exportCurrentThread()"
                                   class="w-9 h-9 rounded-lg text-token-secondary hover:bg-token-hover flex items-center justify-center transition-colors"
@@ -531,11 +588,9 @@ jobs:
                       </div>
                   </header>
 
-                  <!-- Scrollable Messages Stream -->
                   <div id="messages-container" class="flex-1 overflow-y-auto px-4 scroll-smooth">
                       <div class="max-w-[48rem] mx-auto min-h-full flex flex-col">
 
-                          <!-- Empty State (ChatGPT Centered Greeting) -->
                           <div id="welcome-screen" class="my-auto py-10 flex flex-col items-center justify-center text-center">
                               <div class="w-12 h-12 rounded-full bg-token-primary text-token-main flex items-center justify-center text-xl mb-5 shadow-sm">
                                   <i class="fa-solid fa-shield-halved"></i>
@@ -544,7 +599,6 @@ jobs:
                                   چه متنی را برایتان بررسی کنم؟
                               </h1>
 
-                              <!-- Starter Pills Grid -->
                               <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full max-w-2xl text-right">
                                   <button onclick="useStarter('سلام وقت بخیر، از همکاری با شما بسیار خوشحالم.')"
                                           class="group px-4 py-3 rounded-2xl border border-token-border bg-transparent hover:bg-token-surface transition-colors flex flex-col gap-1">
@@ -584,12 +638,10 @@ jobs:
                               </div>
                           </div>
 
-                          <!-- Active Thread Conversation Stream -->
                           <div id="chat-stream" class="space-y-6 py-6 hidden"></div>
                       </div>
                   </div>
 
-                  <!-- ================= BOTTOM FLOATING PROMPT COMPOSER (ChatGPT #2f2f2f) ================= -->
                   <div class="w-full px-4 pb-3 pt-1 bg-token-main shrink-0">
                       <div class="max-w-[48rem] mx-auto">
                           <div class="relative flex flex-col bg-token-surface rounded-[26px] border border-token-border px-3.5 py-2.5 shadow-sm focus-within:border-gray-400/40 dark:focus-within:border-white/20 transition-colors">
@@ -602,7 +654,6 @@ jobs:
                                         dir="auto"></textarea>
 
                               <div class="flex items-center justify-between pt-2 px-0.5">
-                                  <!-- Left/Right Composer Pill Actions -->
                                   <div class="flex items-center gap-1.5">
                                       <button onclick="pasteClipboard()"
                                               class="h-8 px-2.5 rounded-full border border-token-border text-xs text-token-secondary hover:bg-token-hover flex items-center gap-1.5 transition-colors"
@@ -617,7 +668,6 @@ jobs:
                                       </button>
                                   </div>
 
-                                  <!-- Send Button (ChatGPT Monochrome Circle) -->
                                   <div class="flex items-center gap-2.5">
                                       <span id="char-counter" class="text-[11px] text-token-tertiary font-mono hidden"></span>
                                       <button id="send-btn" onclick="analyze()" disabled
@@ -637,7 +687,6 @@ jobs:
                   </div>
               </main>
 
-              <!-- ================= SETTINGS & ENSEMBLE MODAL ================= -->
               <div id="settings-modal" onclick="if(event.target===this)closeSettingsModal()"
                    class="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 hidden items-center justify-center p-4">
                   <div class="bg-token-surface border border-token-border rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 animate-fadeIn">
@@ -664,6 +713,10 @@ jobs:
                               <span class="text-token-secondary">حالت تک‌مدل قاطع (Strong Single)</span>
                               <span class="font-mono font-semibold text-token-primary">0.90</span>
                           </div>
+                          <div class="flex justify-between items-center p-3 bg-token-main rounded-xl border border-token-border">
+                              <span class="text-token-secondary">همزمانی پردازش (Concurrency)</span>
+                              <span id="cfg-concurrency" class="font-mono font-semibold text-token-primary">—</span>
+                          </div>
                           <div class="p-3 bg-token-main rounded-xl border border-token-border">
                               <div class="text-token-secondary mb-2 font-medium">وضعیت مدل‌های بارگذاری‌شده در حافظه:</div>
                               <div id="cfg-models" class="space-y-1.5 text-[11px] font-mono text-token-primary">در حال بررسی...</div>
@@ -684,7 +737,6 @@ jobs:
                   </div>
               </div>
 
-              <!-- Toast Notification -->
               <div id="toast" class="fixed top-4 left-1/2 -translate-x-1/2 z-50 hidden bg-token-primary text-token-main px-4 py-2 rounded-full shadow-lg text-xs font-medium items-center gap-2">
                   <i class="fa-solid fa-check text-emerald-500"></i>
                   <span id="toast-message">انجام شد</span>
@@ -695,14 +747,11 @@ jobs:
           </html>
           HTMLEOF
 
-          # ==================================================================
-          # FRONTEND LOGIC — Multi-Turn Threads + ChatGPT Interactions
-          # ==================================================================
           cat > app/static/script.js << 'JSEOF'
           const STORAGE_KEY = 'polyguard_chatgpt_threads_v3';
 
           const state = {
-            threads: [],       // [{ id, title, createdAt, updatedAt, messages: [{ id, text, result, ts }] }]
+            threads: [],
             activeThreadId: null,
             sidebarOpen: true,
             isAnalyzing: false,
@@ -726,9 +775,6 @@ jobs:
             });
           };
 
-          /**************************************************************
-           * STORAGE & MIGRATION
-           **************************************************************/
           function loadState() {
             try {
               const raw = localStorage.getItem(STORAGE_KEY);
@@ -738,9 +784,7 @@ jobs:
                 state.activeThreadId = parsed.activeThreadId || null;
                 state.viewMode = parsed.viewMode || 'detailed';
               }
-            } catch (e) {
-              console.warn(e);
-            }
+            } catch (e) { console.warn(e); }
             updateViewModeCheckmarks();
           }
 
@@ -751,14 +795,9 @@ jobs:
                 activeThreadId: state.activeThreadId,
                 viewMode: state.viewMode
               }));
-            } catch (e) {
-              console.warn(e);
-            }
+            } catch (e) { console.warn(e); }
           }
 
-          /**************************************************************
-           * SERVER HEALTH
-           **************************************************************/
           async function checkHealth() {
             const dot = document.getElementById('status-dot');
             const txt = document.getElementById('status-text');
@@ -768,7 +807,8 @@ jobs:
               state.health = d;
               if (d.status === 'ok') {
                 dot.className = 'w-1.5 h-1.5 rounded-full bg-emerald-500';
-                txt.textContent = `${d.loaded_models.length}/5 مدل آماده`;
+                const inflight = d.inflight || 0;
+                txt.textContent = `${d.loaded_models.length}/5 مدل · ${inflight} در حال پردازش`;
               } else if (d.status === 'loading') {
                 dot.className = 'w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse';
                 txt.textContent = `بارگذاری مدل‌ها (${(d.loaded || []).length}/5)…`;
@@ -776,6 +816,12 @@ jobs:
                 dot.className = 'w-1.5 h-1.5 rounded-full bg-rose-500';
                 txt.textContent = 'خطا در بارگذاری';
               }
+
+              const cfgC = document.getElementById('cfg-concurrency');
+              if (cfgC && d.concurrency) {
+                cfgC.textContent = `${d.concurrency} همزمان (Peak: ${d.peak || 0})`;
+              }
+
               const cfgM = document.getElementById('cfg-models');
               if (cfgM && d.loaded_models) {
                 cfgM.innerHTML = d.loaded_models.map(m => `<div class="flex items-center justify-between py-0.5"><span>${m}</span><span class="text-emerald-500">● Ready</span></div>`).join('') +
@@ -789,9 +835,6 @@ jobs:
             }
           }
 
-          /**************************************************************
-           * SIDEBAR & NAVIGATION
-           **************************************************************/
           function toggleSidebar() {
             const sidebar = document.getElementById('sidebar');
             const backdrop = document.getElementById('mobile-backdrop');
@@ -896,11 +939,7 @@ jobs:
 
             const now = Date.now();
             const oneDay = 86400000;
-            const groups = {
-              'امروز': [],
-              '۷ روز گذشته': [],
-              'قدیمی‌تر': []
-            };
+            const groups = { 'امروز': [], '۷ روز گذشته': [], 'قدیمی‌تر': [] };
 
             filtered.forEach(t => {
               const age = now - (t.updatedAt || t.createdAt || now);
@@ -943,9 +982,6 @@ jobs:
             container.innerHTML = html;
           }
 
-          /**************************************************************
-           * RENDER ACTIVE THREAD (MULTI-TURN CHATGPT STREAM)
-           **************************************************************/
           function renderActiveThread() {
             const welcome = document.getElementById('welcome-screen');
             const stream = document.getElementById('chat-stream');
@@ -1061,14 +1097,12 @@ jobs:
               <article class="space-y-4 animate-fadeIn">
                 ${userHTML}
 
-                <!-- Assistant Response Row -->
                 <div class="flex items-start gap-3.5">
                   <div class="w-7 h-7 rounded-full border border-token-border bg-token-surface text-token-primary flex items-center justify-center text-xs shrink-0 mt-0.5">
                     <i class="fa-solid fa-shield-halved"></i>
                   </div>
 
                   <div class="flex-1 min-w-0 space-y-2">
-                    <!-- Main Verdict Card -->
                     <div class="border border-token-border bg-token-surface/40 rounded-2xl p-4">
                       <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
                         <span class="px-2.5 py-1 rounded-full text-xs font-semibold border ${decisionMeta.badgeBg}">
@@ -1083,7 +1117,6 @@ jobs:
                         ${decisionMeta.summary}
                       </p>
 
-                      <!-- Quick Metrics Pills -->
                       <div class="grid grid-cols-3 gap-2 text-center bg-token-main/60 p-2.5 rounded-xl border border-token-border">
                         <div>
                           <div class="text-[10px] text-token-tertiary">آرای سمیت</div>
@@ -1102,7 +1135,6 @@ jobs:
 
                     ${detailsSection}
 
-                    <!-- ChatGPT Message Action Bar -->
                     <div class="flex items-center gap-1 pt-0.5 text-token-tertiary">
                       <button onclick="copyReport('${msg.id}')"
                               class="p-1.5 rounded-lg hover:bg-token-hover hover:text-token-primary transition-colors text-xs flex items-center gap-1"
@@ -1125,9 +1157,6 @@ jobs:
               </article>`;
           }
 
-          /**************************************************************
-           * ANALYZE SUBMISSION
-           **************************************************************/
           async function analyze(overrideText) {
             const input = document.getElementById('prompt-input');
             const text = (typeof overrideText === 'string' ? overrideText : input.value).trim();
@@ -1141,7 +1170,6 @@ jobs:
               autoResize(input);
             }
 
-            // Ensure an active thread exists
             let thread = state.threads.find(t => t.id === state.activeThreadId);
             if (!thread) {
               thread = {
@@ -1222,9 +1250,6 @@ jobs:
             analyze(msg.text);
           }
 
-          /**************************************************************
-           * COMPOSER & UI HELPERS
-           **************************************************************/
           function autoResize(el) {
             el.style.height = 'auto';
             el.style.height = Math.min(el.scrollHeight, 176) + 'px';
@@ -1376,7 +1401,7 @@ jobs:
           }
           JSEOF
 
-          echo "✔ All ChatGPT-themed app files created"
+          echo "✔ All app files created"
           ls -R app
 
       - name: Install cloudflared
@@ -1385,25 +1410,37 @@ jobs:
           chmod +x cloudflared
           ./cloudflared --version
 
-      - name: Start FastAPI server
+      - name: Start FastAPI server (concurrent, 4 workers)
         run: |
-          nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
-          echo "Waiting for 5 models to load (~120-300s)..."
+          # Run 4 Uvicorn workers behind Gunicorn. Each worker:
+          #   - has torch.set_num_threads(1) → so 4 workers × 1 thread = 4 cores fully used
+          #   - loads all 5 models (RAM cost ~4×) — fits in 16 GB
+          # Together they can serve 4 inferences truly in parallel.
+          nohup gunicorn app.main:app \
+              --workers 4 \
+              --worker-class uvicorn.workers.UvicornWorker \
+              --bind 0.0.0.0:8000 \
+              --timeout 120 \
+              --graceful-timeout 30 \
+              --keep-alive 5 \
+              > server.log 2>&1 &
+
+          echo "Waiting for models to load (~120-300s × maybe 4 workers)…"
           STATUS=""
-          for i in $(seq 1 150); do
+          for i in $(seq 1 300); do
             STATUS=$(curl -fs http://localhost:8000/health 2>/dev/null || true)
             if echo "$STATUS" | grep -q '"status":"ok"'; then
-              echo "✔ All models loaded after ${i} checks (~$((i*2))s)"
+              echo "✔ Ready after ${i} checks (~$((i*2))s)"
               break
             fi
             if echo "$STATUS" | grep -q '"status":"error"'; then
-              echo "❌ All models failed:"
+              echo "❌ Models failed:"
               echo "$STATUS"
               tail -n 80 server.log || true
               exit 1
             fi
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "  ... still loading (${i}/150) —$STATUS"
+            if [ $((i % 15)) -eq 0 ]; then
+              echo "  ... still loading (${i}/300) — $STATUS"
             fi
             sleep 2
           done
@@ -1413,7 +1450,26 @@ jobs:
             tail -n 100 server.log || true
             exit 1
           fi
-          echo "$STATUS" | grep -q '"errors":{}' || echo "⚠ Partial ensemble: $STATUS"
+
+      - name: Concurrency smoke test
+        run: |
+          echo "--- firing 8 parallel requests ---"
+          time (
+            for n in $(seq 1 8); do
+              curl -s -X POST http://localhost:8000/api/check \
+                -H 'Content-Type: application/json' \
+                -d '{"text":"You are crazy"}' \
+                -o /tmp/resp_$n.json &
+            done
+            wait
+          )
+          echo "--- results ---"
+          for n in $(seq 1 8); do
+            echo "req $n: $(head -c 200 /tmp/resp_$n.json)"
+            echo
+          done
+          echo "--- health after load ---"
+          curl -s http://localhost:8000/health | head -c 500
 
       - name: Start Cloudflare Quick Tunnel
         run: |
@@ -1440,13 +1496,20 @@ jobs:
           echo "Will self-terminate after ~5 hours."
           for i in $(seq 1 300); do
             sleep 60
-            pgrep -f "uvicorn app.main:app" >/dev/null || {
-              echo "⚠ Uvicorn died, restarting..."
+            pgrep -f "gunicorn app.main:app" >/dev/null || {
+              echo "⚠ Gunicorn died, restarting…"
               MODELS_ROOT="$MODELS_ROOT" \
-                nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 >> server.log 2>&1 &
+                nohup gunicorn app.main:app \
+                  --workers 4 \
+                  --worker-class uvicorn.workers.UvicornWorker \
+                  --bind 0.0.0.0:8000 \
+                  --timeout 120 \
+                  --graceful-timeout 30 \
+                  --keep-alive 5 \
+                  >> server.log 2>&1 &
             }
             pgrep -f "cloudflared tunnel" >/dev/null || {
-              echo "⚠ Cloudflared died, restarting..."
+              echo "⚠ Cloudflared died, restarting…"
               nohup ./cloudflared tunnel --url http://localhost:8000 --no-autoupdate >> tunnel.log 2>&1 &
             }
           done
