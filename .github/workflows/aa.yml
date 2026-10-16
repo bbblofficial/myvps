@@ -10,7 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MODEL_ID: unitary/multilingual-toxic-xlm-roberta
+  # ✅ Changed to the efficient, multilingual model designed for CPU
+  MODEL_ID: desert-ant-labs/toxic
   MODEL_DIR: ${{ github.workspace }}/models/polyguard
 
 jobs:
@@ -27,12 +28,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ─── FIX: added sentencepiece + tiktoken ───
+      # ✅ FIXED: Added protobuf (required by sentencepiece) and tiktoken
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
-          pip install --quiet fastapi "uvicorn[standard]" transformers sentencepiece tiktoken
+          pip install --quiet fastapi "uvicorn[standard]" transformers sentencepiece protobuf tiktoken
 
       - name: Download model to local folder
         run: |
@@ -43,7 +44,6 @@ jobs:
           snapshot_download(
               repo_id=os.environ["MODEL_ID"],
               local_dir=os.environ["MODEL_DIR"],
-              local_dir_use_symlinks=False,
               ignore_patterns=["*.h5", "*.msgpack", "*.onnx", "*.tflite", "*.ot"],
           )
           print("✔ Model downloaded")
@@ -55,6 +55,7 @@ jobs:
         run: |
           mkdir -p app/static
 
+          # ---------- backend ----------
           cat > app/main.py << 'PYEOF'
           import os
           os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -80,11 +81,11 @@ jobs:
 
           def load_classifier():
               print(f"[PolyGuard] Loading model from {MODEL_DIR}", flush=True)
+              # ✅ Use a simpler pipeline for the new multi-label model
               state["classifier"] = pipeline(
                   "text-classification",
                   model=str(MODEL_DIR),
                   tokenizer=str(MODEL_DIR),
-                  function_to_apply="sigmoid",
                   top_k=None,
               )
               print("[PolyGuard] Model loaded ✔", flush=True)
@@ -113,6 +114,8 @@ jobs:
               if state["classifier"] is None:
                   return {"error": state["error"] or "model still loading"}
               results = state["classifier"](data.text, truncation=True, max_length=512)[0]
+              # ✅ New model returns a list of labels with scores.
+              # We find the highest score to determine toxicity.
               top = max(results, key=lambda r: r["score"])
               is_toxic = top["score"] >= TOXIC_THRESHOLD
               return {"toxic": is_toxic, "label": top["label"], "score": float(top["score"])}
@@ -124,6 +127,7 @@ jobs:
           app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
           PYEOF
 
+          # ---------- frontend ----------
           cat > app/static/index.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html lang="fa" dir="rtl">
@@ -142,7 +146,7 @@ jobs:
               <textarea id="txt" placeholder="متن خود را اینجا بنویسید..."></textarea>
               <button id="btn">بررسی کن</button>
               <div id="out" class="out hidden"></div>
-              <footer>Powered by unitary/multilingual-toxic-xlm-roberta</footer>
+              <footer>Powered by desert-ant-labs/toxic</footer>
             </div>
             <script src="/static/script.js"></script>
           </body>
